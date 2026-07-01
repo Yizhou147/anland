@@ -52,6 +52,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
+    private static final String KEY_BACK_DOUBLE_PRESS_EXIT = "back_double_press_exit";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
@@ -388,6 +389,24 @@ public class SettingsActivity extends Activity {
         backOpensExtraKeysHint.setTextColor(Color.GRAY);
         backOpensExtraKeysHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(backOpensExtraKeysHint);
+
+        // === Double-press Back to exit ===
+        Switch doubleBackExitSwitch = new Switch(this);
+        doubleBackExitSwitch.setText(R.string.double_back_exit_switch);
+        doubleBackExitSwitch.setTextSize(14);
+        doubleBackExitSwitch.setPadding(0, dp(16), 0, 0);
+        doubleBackExitSwitch.setChecked(prefs.getBoolean(KEY_BACK_DOUBLE_PRESS_EXIT, false));
+        doubleBackExitSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_BACK_DOUBLE_PRESS_EXIT, checked).apply());
+        root.addView(doubleBackExitSwitch);
+
+        TextView doubleBackExitHint = new TextView(this);
+        doubleBackExitHint.setText(R.string.double_back_exit_hint);
+        doubleBackExitHint.setTextSize(12);
+        doubleBackExitHint.setTextColor(Color.GRAY);
+        doubleBackExitHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(doubleBackExitHint);
 
         // === Keyboard floating ===
         Switch keyboardFloatingSwitch = new Switch(this);
