@@ -116,6 +116,11 @@ public class ExtraKeysBar extends GridLayout {
         "      {\"label\":\"→\",    \"type\":\"key\",      \"code\":106, \"repeat\":true},\n" +
         "      {\"label\":\"PGDN\", \"type\":\"key\",      \"code\":109, \"repeat\":true},\n" +
         "      {\"label\":\"⚙\",    \"type\":\"settings\"}\n" +
+        "    ],\n" +
+        "    [\n" +
+        "      {\"label\":\"C\",    \"type\":\"key\",      \"code\":46},\n" +
+        "      {\"label\":\"V\",    \"type\":\"key\",      \"code\":47},\n" +
+        "      {\"label\":\"Enter\",\"type\":\"key\",      \"code\":28}\n" +
         "    ]\n" +
         "  ]\n" +
         "}\n";
@@ -254,6 +259,11 @@ public class ExtraKeysBar extends GridLayout {
                 Key.rep("→", EV_RIGHT),
                 Key.rep("PGDN", EV_PAGEDOWN),
                 Key.settings(GLYPH_SETTINGS),
+            },
+            {
+                Key.key("C", 46),
+                Key.key("V", 47),
+                Key.key("Enter", 28),
             },
         };
     }
