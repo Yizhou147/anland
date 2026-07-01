@@ -67,6 +67,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
+    private static final String KEY_BACK_DOUBLE_PRESS_EXIT = "back_double_press_exit";
+    private static final long BACK_DOUBLE_PRESS_MS = 2000;
+    private long mLastBackPressTime = 0;
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     // When on, the IME and extra-keys bar float over the display instead of
     // shrinking it: the bar rides up with the keyboard but the surface keeps
@@ -1004,8 +1007,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // when enabled in settings. Leaves the default swallow behaviour otherwise.
         if (keyCode == KeyEvent.KEYCODE_BACK
                 && prefs.getBoolean(KEY_BACK_OPENS_EXTRA_KEYS, true)) {
-            toggleExtraKeysBar();
-            return true;
+            if (prefs.getBoolean(KEY_BACK_DOUBLE_PRESS_EXIT, false)) {
+                if (extraKeysBar != null
+                        && extraKeysBar.getVisibility() == View.VISIBLE) {
+                    long now = System.currentTimeMillis();
+                    if (now - mLastBackPressTime < BACK_DOUBLE_PRESS_MS) {
+                        super.onKeyDown(keyCode, event);
+                        return true;
+                    } else {
+                        mLastBackPressTime = now;
+                        android.widget.Toast.makeText(this,
+                            "再按一次返回退出", android.widget.Toast.LENGTH_SHORT).show();
+                        return true;
+                    }
+                } else {
+                    toggleExtraKeysBar();
+                    return true;
+                }
+            } else {
+                toggleExtraKeysBar();
+                return true;
+            }
         }
 
         int scanCode = event.getScanCode();
@@ -1030,7 +1052,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public void onBackPressed() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         if (prefs.getBoolean(KEY_BACK_OPENS_EXTRA_KEYS, true)) {
-            toggleExtraKeysBar();
+            if (prefs.getBoolean(KEY_BACK_DOUBLE_PRESS_EXIT, false)) {
+                // Double-press-to-exit: first press toggles bar, second press
+                // within 2 s actually exits.
+                if (extraKeysBar != null
+                        && extraKeysBar.getVisibility() == View.VISIBLE) {
+                    long now = System.currentTimeMillis();
+                    if (now - mLastBackPressTime < BACK_DOUBLE_PRESS_MS) {
+                        super.onBackPressed();
+                    } else {
+                        mLastBackPressTime = now;
+                        android.widget.Toast.makeText(this,
+                            "再按一次返回退出", android.widget.Toast.LENGTH_SHORT).show();
+                    }
+                } else {
+                    toggleExtraKeysBar();
+                }
+            } else {
+                toggleExtraKeysBar();
+            }
         } else {
             super.onBackPressed();
         }
