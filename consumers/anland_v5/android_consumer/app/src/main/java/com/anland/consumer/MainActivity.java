@@ -110,7 +110,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public static final String KEY_MOUSE_ACCEL = "mouse_speed"; // 名称仍为 speed，实际控制加速度强度
 
     private boolean isTouchpadMode = true;
-    private float mouseAccelStrength = 1.0f; // 加速度强度，0.5 ~ 10.0
+    private float mouseAccelStrength = 1.5f; // 加速度强度，0.5 ~ 10.0
 
     // 状态机
     private static final int STATE_IDLE = 0;
@@ -353,8 +353,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // ===== 新增：加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        mouseAccelStrength = prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f);
+        isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, true);
+        mouseAccelStrength = prefs.getFloat(KEY_MOUSE_ACCEL, 1.5f);
         mouseAccelStrength = Math.max(0.5f, Math.min(10.0f, mouseAccelStrength)); // 范围扩大到 10.0
         touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         updateScreenSize();
@@ -370,21 +370,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (nm == null) return;
 
         NotificationChannel channel = new NotificationChannel(
-                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_LOW);
+                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_DEFAULT);
         channel.setDescription("Anland quick access");
         channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nm.createNotificationChannel(channel);
 
         Intent intent = new Intent(this, SettingsActivity.class);
-        intent.setAction(Intent.ACTION_MAIN);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Notification notification = new Notification.Builder(this, NOTIFICATION_CHANNEL)
                 .setContentTitle("Anland")
                 .setContentText("点击进入设置")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(pi)
+                .setAutoCancel(true)
                 .setOngoing(true)
                 .setShowWhen(false)
                 .build();
@@ -489,8 +490,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // ===== 新增：重新读取触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        mouseAccelStrength = prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f);
+        isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, true);
+        mouseAccelStrength = prefs.getFloat(KEY_MOUSE_ACCEL, 1.5f);
         mouseAccelStrength = Math.max(0.5f, Math.min(10.0f, mouseAccelStrength));
     }
 
