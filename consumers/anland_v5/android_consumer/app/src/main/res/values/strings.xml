@@ -38,6 +38,8 @@
     <string name="auto_show_hint">When ON, extra keys bar appears automatically with the soft keyboard and hides when it closes. When OFF, bar stays visible until manually toggled via settings.</string>
     <string name="back_opens_switch">Back key opens extra keys bar</string>
     <string name="back_opens_hint">When ON, pressing Back while the extra keys bar is hidden shows it; pressing Back again hides it. Use this to reach the extra keys without first opening the soft keyboard.</string>
+    <string name="double_back_exit_switch">Double-press Back to exit</string>
+    <string name="double_back_exit_hint">When ON, pressing Back while the extra keys bar is visible requires two presses within 2 seconds to actually exit the app. Prevents accidental exits on some devices (e.g. Xiaomi/HyperOS).</string>
     <string name="keyboard_floating_switch">Keyboard floating (overlay display)</string>
     <string name="keyboard_floating_hint">When ON, the soft keyboard and the extra keys bar float over the display area instead of shrinking it; the bar uses a translucent background and rises with the keyboard, but the display is not resized. When OFF, the original behaviour (display shrinks to make room) is kept. Takes effect on next return to the desktop.</string>
 
