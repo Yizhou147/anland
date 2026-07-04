@@ -405,14 +405,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (nm == null) return;
 
         NotificationChannel channel = new NotificationChannel(
-<<<<<<< HEAD
-                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_DEFAULT);
-        channel.setDescription("Anland quick access");
-=======
                 NOTIFICATION_CHANNEL, getString(R.string.notification_channel_name),
                 NotificationManager.IMPORTANCE_LOW);
         channel.setDescription(getString(R.string.notification_channel_desc));
->>>>>>> fix/freeform-keyboard
         channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nm.createNotificationChannel(channel);
 
@@ -454,14 +449,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int parentW = mRoot.getWidth();
         int parentH = mRoot.getHeight();
         if (parentW <= 0 || parentH <= 0) {
-<<<<<<< HEAD
-            DisplayMetrics dm = getResources().getDisplayMetrics();
-            parentW = dm.widthPixels;
-            parentH = dm.heightPixels;
-        }
-        float x = (parentW - w) / 2f;
-        float y = parentH - h - dpToPx(50);
-=======
             // Root not laid out yet — retry next frame.
             if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
                 virtualKeyboardView.post(this::positionVirtualKeyboard);
@@ -473,7 +460,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // Clamp to visible area.
         x = Math.max(0, Math.min(x, parentW - w));
         y = Math.max(0, Math.min(y, parentH - h));
->>>>>>> fix/freeform-keyboard
         virtualKeyboardView.setX(x);
         virtualKeyboardView.setY(y);
         Log.d("VirtualKeyboard", "positionVirtualKeyboard: x=" + x + ", y=" + y
