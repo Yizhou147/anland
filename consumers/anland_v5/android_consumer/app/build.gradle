@@ -32,8 +32,21 @@ android {
         }
     }
 
+    // Unified signing: use the debug keystore for both build types so that
+    // installing a debug APK over a release APK (or vice versa) never fails
+    // with a signature mismatch.
+    signingConfigs {
+        debug {
+            storeFile file("${System.getProperty('user.home')}/.android/debug.keystore")
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
         release {
+            signingConfig signingConfigs.debug
             minifyEnabled false
         }
     }
