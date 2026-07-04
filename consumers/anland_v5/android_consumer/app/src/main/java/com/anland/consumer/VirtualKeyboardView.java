@@ -378,26 +378,26 @@ package com.anland.consumer;
      } 
   
      // ========== 测量与布局 ========== 
-     @Override 
-    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) { 
-        try { 
+     @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        try {
             // Refresh screen size so freeform / resize is picked up.
             updateScreenSize();
-            int desiredWidth = (int) (screenWidth * 0.45f); 
-            if (desiredWidth < 400) desiredWidth = 400; 
+            int desiredWidth = (int) (screenWidth * 0.45f);
+            if (desiredWidth < 400) desiredWidth = 400;
             // In freeform mode the keyboard must not exceed the parent width.
             int maxWidth = MeasureSpec.getSize(widthMeasureSpec);
             if (maxWidth > 0 && desiredWidth > maxWidth) desiredWidth = maxWidth;
-            int rowCount = keyboardRows.length; 
-            int keyH = dpToPx(32); 
-            int totalHeight = dragHandleHeight + padding + rowCount * (keyH + padding) + padding; 
-            if (totalHeight <= 0) totalHeight = 350; 
-            setMeasuredDimension(desiredWidth, totalHeight); 
-            Log.d(TAG, "onMeasure: " + desiredWidth + "x" + totalHeight); 
-        } catch (Exception e) { 
-            Log.e(TAG, "onMeasure error", e); 
-            setMeasuredDimension(600, 350); 
-        } 
+            int rowCount = keyboardRows.length;
+            int keyH = dpToPx(32);
+            int totalHeight = dragHandleHeight + padding + rowCount * (keyH + padding) + padding;
+            if (totalHeight <= 0) totalHeight = 350;
+            setMeasuredDimension(desiredWidth, totalHeight);
+            Log.d(TAG, "onMeasure: " + desiredWidth + "x" + totalHeight);
+        } catch (Exception e) {
+            Log.e(TAG, "onMeasure error", e);
+            setMeasuredDimension(600, 350);
+        }
     } 
   
      @Override 
@@ -465,25 +465,29 @@ package com.anland.consumer;
             }
             int w = getWidth();
             int h = getHeight();
-            // Use parent dimensions for correct positioning in freeform mode.
-            int pw = screenWidth;
-            int ph = screenHeight;
+            // Use parent view dimensions — correct in freeform / small-window mode.
+            int pw = 0, ph = 0;
             ViewParent pp = getParent();
             if (pp instanceof View) {
-                int pw2 = ((View) pp).getWidth();
-                int ph2 = ((View) pp).getHeight();
-                if (pw2 > 0 && ph2 > 0) {
-                    pw = pw2;
-                    ph = ph2;
-                }
+                pw = ((View) pp).getWidth();
+                ph = ((View) pp).getHeight();
             }
-            if (w > 0 && h > 0 && pw > 0 && ph > 0) {
+            if (pw <= 0 || ph <= 0) {
+                // Parent not laid out yet — retry next frame.
+                post(this::setInitialPosition);
+                return;
+            }
+            if (w > 0 && h > 0) {
                 float x = (pw - w) / 2f;
                 float y = ph - h - dpToPx(50);
+                // Clamp to visible area.
+                x = Math.max(0, Math.min(x, pw - w));
+                y = Math.max(0, Math.min(y, ph - h));
                 setTranslationX(x);
                 setTranslationY(y);
                 bringToFront();
-                Log.d(TAG, "setInitialPosition: x=" + x + ", y=" + y);
+                Log.d(TAG, "setInitialPosition: x=" + x + ", y=" + y
+                        + " parent=" + pw + "x" + ph + " view=" + w + "x" + h);
             }
         } catch (Exception e) {
             Log.e(TAG, "setInitialPosition error", e);
@@ -675,8 +679,8 @@ package com.anland.consumer;
   
              if (action == MotionEvent.ACTION_DOWN && y < dragHandleHeight) { 
                  isDragging = true; 
-                 lastRawX = event.getRawX(); 
-                 lastRawY = event.getRawY(); 
+                 lastRawX = x; 
+                 lastRawY = y; 
                  bringToFront(); 
                  return true; 
              } 
@@ -684,14 +688,17 @@ package com.anland.consumer;
              if (isDragging) { 
                  switch (action) { 
                      case MotionEvent.ACTION_MOVE: 
-                         float dx = event.getRawX() - lastRawX; 
-                         float dy = event.getRawY() - lastRawY; 
+                         // Use view-relative getX()/getY() instead of getRawX()/getRawY()
+                         // so that dragging works correctly in freeform / small-window mode
+                         // where the window has a screen offset.
+                         float dx = event.getX() - lastRawX; 
+                         float dy = event.getY() - lastRawY; 
                          float newX = getTranslationX() + dx; 
                          float newY = getTranslationY() + dy; 
                          setTranslationX(newX);
                          setTranslationY(newY);
-                         lastRawX = event.getRawX();
-                         lastRawY = event.getRawY(); 
+                         lastRawX = event.getX();
+                         lastRawY = event.getY(); 
                          return true; 
                      case MotionEvent.ACTION_UP: 
                      case MotionEvent.ACTION_CANCEL: 

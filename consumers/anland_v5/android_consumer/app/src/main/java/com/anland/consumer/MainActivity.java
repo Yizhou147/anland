@@ -78,6 +78,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // its full size. See relayout() and buildExtraKeysBar().
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private boolean mKeyboardFloating = false;
+    // Persistent "tap to open Settings" notification, toggleable in Settings > General.
+    private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
     private EditText hiddenInput;
     private InputMethodManager imm;
     private int mImeBottom = 0;   // last IME bottom inset
@@ -331,6 +333,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.NO_GRAVITY
         ));
+        // Reposition the virtual keyboard when the root layout size changes
+        // (e.g. freeform / small-window mode resize).
+        root.addOnLayoutChangeListener((v, left, top, right, bottom,
+                oldLeft, oldTop, oldRight, oldBottom) -> {
+            int newW = right - left;
+            int newH = bottom - top;
+            int oldW = oldRight - oldLeft;
+            int oldH = oldBottom - oldTop;
+            Log.d("VirtualKeyboard", "root layout changed: " + newW + "x" + newH
+                    + " (was " + oldW + "x" + oldH + ")");
+            if (newW != oldW || newH != oldH) {
+                if (virtualKeyboardView != null
+                        && virtualKeyboardView.getVisibility() == View.VISIBLE) {
+                    positionVirtualKeyboard();
+                }
+            }
+        });
         // Positioning happens lazily the first time the keyboard is shown
         // (see toggleVirtualKeyboard). Positioning it here would spin forever:
         // the view starts GONE and a GONE view is never measured.
@@ -386,8 +405,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (nm == null) return;
 
         NotificationChannel channel = new NotificationChannel(
-                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_DEFAULT);
-        channel.setDescription("Anland quick access");
+                NOTIFICATION_CHANNEL, getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription(getString(R.string.notification_channel_desc));
         channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nm.createNotificationChannel(channel);
 
@@ -397,8 +417,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 PendingIntent.FLAG_CANCEL_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Notification notification = new Notification.Builder(this, NOTIFICATION_CHANNEL)
-                .setContentTitle("Anland")
-                .setContentText("点击进入设置")
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(getString(R.string.notification_text))
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(pi)
                 .setAutoCancel(true)
@@ -429,14 +449,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int parentW = mRoot.getWidth();
         int parentH = mRoot.getHeight();
         if (parentW <= 0 || parentH <= 0) {
-            DisplayMetrics dm = getResources().getDisplayMetrics();
-            parentW = dm.widthPixels;
-            parentH = dm.heightPixels;
+            // Root not laid out yet — retry next frame.
+            if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
+                virtualKeyboardView.post(this::positionVirtualKeyboard);
+            }
+            return;
         }
         float x = (parentW - w) / 2f;
         float y = parentH - h - dpToPx(50);
+        // Clamp to visible area.
+        x = Math.max(0, Math.min(x, parentW - w));
+        y = Math.max(0, Math.min(y, parentH - h));
         virtualKeyboardView.setX(x);
         virtualKeyboardView.setY(y);
+        Log.d("VirtualKeyboard", "positionVirtualKeyboard: x=" + x + ", y=" + y
+                + " parent=" + parentW + "x" + parentH + " view=" + w + "x" + h);
     }
 
     private int dpToPx(int dp) {
@@ -462,13 +489,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onResume() {
         super.onResume();
 
-        // Show settings notification while in foreground
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                        != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+        // Show settings notification while in foreground, unless disabled in Settings.
+        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_NOTIFICATION_ENABLED, true)) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                            != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+            } else {
+                showSettingsNotification();
+            }
         } else {
-            showSettingsNotification();
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(NOTIFICATION_ID);
         }
 
         // Re-check accessibility service state on resume
@@ -611,7 +644,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 cameraInited = true;
             }
         } else if (requestCode == 1003) {
-            showSettingsNotification();
+            if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(KEY_NOTIFICATION_ENABLED, true)) {
+                showSettingsNotification();
+            }
         }
     }
 
@@ -680,8 +716,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             | android.text.InputType.TYPE_TEXT_VARIATION_NORMAL);
     }
 
+    // Mirror of the text we have pushed to the remote via the IME path, with the
+    // cursor implicitly at its end (we only ever append text or backspace from the
+    // tail). Maintained at the sendText/tapKey choke points so it stays accurate no
+    // matter which InputConnection method drove the change. Used to re-seed the
+    // composing tracker when the IME reclaims already-sent text as a composing
+    // region (see ForwardingInputConnection.setComposingRegion).
+    private final StringBuilder mMirror = new StringBuilder();
+    // Only the trailing text is ever needed (a composing region is at most a word);
+    // drop the head past this bound so a long session can't grow the buffer forever.
+    private static final int MIRROR_CAP = 4096;
+
     private void sendText(String text) {
         if (text.isEmpty()) return;
+        mMirror.append(text);
+        if (mMirror.length() > MIRROR_CAP) {
+            mMirror.delete(0, mMirror.length() - MIRROR_CAP);
+        }
         nativeSendTextInput(text.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -804,10 +855,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         @Override
         public boolean deleteSurroundingText(int beforeLength, int afterLength) {
             for (int i = 0; i < beforeLength; i++) {
+                if (mMirror.length() > 0) {
+                    mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                }
                 tapKey(EVDEV_BACKSPACE);
             }
             for (int i = 0; i < afterLength; i++) {
                 tapKey(EVDEV_DELETE);
+            }
+            return true;
+        }
+
+        @Override
+        public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            for (int i = 0; i < beforeLength; i++) {
+                if (mMirror.length() > 0) {
+                    mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                }
+                tapKey(EVDEV_BACKSPACE);
+            }
+            for (int i = 0; i < afterLength; i++) {
+                tapKey(EVDEV_DELETE);
+            }
+            return true;
+        }
+
+        // The IME reclaims text it previously committed as a fresh composing region
+        // (e.g. backspacing into a finished word: it deletes a char, then re-composes
+        // the remainder before replacing it). We keep no Editable, so the base class
+        // can't honour this — and because our composing tracker is empty at this
+        // point, the follow-up setComposingText would diff against "" and *append*
+        // the replacement instead of overwriting, turning "shado"+"shad" into
+        // "shadoshad". Re-seed the tracker with the region's text so replaceComposing()
+        // backspaces the difference. The cursor always sits at the tail of what we've
+        // sent, so the region is the last (end - start) chars of the mirror — reading
+        // it as a length keeps us correct whether the IME's indices are document- or
+        // word-relative.
+        @Override
+        public boolean setComposingRegion(int start, int end) {
+            final int len = end - start;
+            if (len >= 0 && len <= mMirror.length()) {
+                composing.setLength(0);
+                composing.append(mMirror, mMirror.length() - len, mMirror.length());
             }
             return true;
         }
@@ -822,6 +911,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 nativeSendKey(0, evdev);
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
                 nativeSendKey(1, evdev);
+                // Keep the mirror consistent with a raw key edit. A backspace pops the
+                // tail; anything else (Enter, Tab, arrows, ...) moves the cursor or
+                // inserts content our tail-only model can't track, so drop the mirror
+                // and composing tracker rather than risk seeding a bad region later.
+                if (evdev == EVDEV_BACKSPACE) {
+                    if (mMirror.length() > 0)
+                        mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                } else {
+                    mMirror.setLength(0);
+                    composing.setLength(0);
+                }
             }
             return true;
         }
@@ -840,6 +940,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             final int erase = prev.codePointCount(prefix, prev.length());
             for (int i = 0; i < erase; i++) {
+                if (mMirror.length() > 0) {
+                    mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                }
                 tapKey(EVDEV_BACKSPACE);
             }
             if (prefix < next.length()) {
@@ -852,6 +955,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         private void eraseComposing() {
             final int erase = composing.codePointCount(0, composing.length());
             for (int i = 0; i < erase; i++) {
+                if (mMirror.length() > 0) {
+                    mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                }
                 tapKey(EVDEV_BACKSPACE);
             }
             composing.setLength(0);
@@ -936,6 +1042,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
                     virtualKeyboardView.setVisibility(View.GONE);
                 } else {
+                    Log.d("VirtualKeyboard", "toggle: showing keyboard, mRoot="
+                            + mRoot.getWidth() + "x" + mRoot.getHeight());
                     virtualKeyboardView.setVisibility(View.VISIBLE);
                     virtualKeyboardView.bringToFront();
                     // Re-position it (in case screen size changed)
@@ -982,7 +1090,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setExtraKeysBarVisible(!visible);
     }
 
+    // Tracks whether we have requested the IME to show.  In freeform mode the
+    // floating IME does NOT affect WindowInsets so isImeVisible() would always
+    // return false; this flag lets toggleSystemKeyboard() know the real state.
+    private boolean imeRequested = false;
+
     private boolean isImeVisible() {
+        if (imeRequested) return true;
         WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
         return insets != null && insets.isVisible(WindowInsets.Type.ime());
     }
@@ -1000,14 +1114,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (imm == null) imm = getSystemService(InputMethodManager.class);
         if (imm == null) return;
         if (isImeVisible()) {
+            // In freeform mode hideSoftInputFromWindow may not work for the
+            // floating IME.  Force-hide by also setting the window soft input
+            // mode and clearing focus from the hidden input.
+            getWindow().setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
             imm.hideSoftInputFromWindow(hiddenInput.getWindowToken(), 0);
             releaseHiddenInput();
+            imeRequested = false;
+            // In freeform mode the inset callback may not fire; hide the bar
+            // explicitly so it tracks the IME state in all modes.
+            setExtraKeysBarVisible(shouldShowBar(false));
         } else {
             hiddenInput.setEnabled(true);
             hiddenInput.setFocusable(true);
             hiddenInput.setFocusableInTouchMode(true);
             hiddenInput.requestFocus();
             imm.showSoftInput(hiddenInput, InputMethodManager.SHOW_IMPLICIT);
+            imeRequested = true;
+            // In freeform / small-window mode the IME appears as a floating
+            // window that does NOT trigger window insets, so applyImeInset()
+            // is never called and the extra-keys bar stays hidden.  Show it
+            // explicitly here so the bar appears alongside the IME in all modes.
+            setExtraKeysBarVisible(shouldShowBar(true));
         }
     }
 
