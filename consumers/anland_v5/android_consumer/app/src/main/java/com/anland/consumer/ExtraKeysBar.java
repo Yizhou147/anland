@@ -120,6 +120,7 @@ public class ExtraKeysBar extends GridLayout {
         "    [\n" +
         "      {\"label\":\"C\",    \"type\":\"key\",      \"code\":46},\n" +
         "      {\"label\":\"V\",    \"type\":\"key\",      \"code\":47},\n" +
+        "      {\"label\":\"SHIFT\",\"type\":\"modifier\", \"code\":42},\n" +
         "      {\"label\":\"BS\",   \"type\":\"key\",      \"code\":14, \"repeat\":true},\n" +
         "      {\"label\":\"Enter\",\"type\":\"key\",      \"code\":28}\n" +
         "    ]\n" +
@@ -264,6 +265,7 @@ public class ExtraKeysBar extends GridLayout {
             {
                 Key.key("C", 46),
                 Key.key("V", 47),
+                Key.mod("SHIFT", EV_LEFTSHIFT),
                 Key.rep("BS", EV_BACKSPACE),
                 Key.key("Enter", 28),
             },

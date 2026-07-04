@@ -865,7 +865,7 @@ public class SettingsActivity extends Activity {
     private void updateStatus() {
         if (statusText == null) return;
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        int bound = prefs.getInt(KEY_BOUND_KEYCODE, UNBOUND);
+        int bound = prefs.getInt(KEY_BOUND_KEYCODE, KeyEvent.KEYCODE_BACK);
         if (bound == UNBOUND) {
             statusText.setText(R.string.status_current_none);
         } else {
