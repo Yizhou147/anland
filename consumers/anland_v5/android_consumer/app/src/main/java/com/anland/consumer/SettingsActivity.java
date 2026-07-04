@@ -537,7 +537,7 @@ public class SettingsActivity extends Activity {
         touchpadModeSwitch.setText(R.string.touchpad_mode_switch);
         touchpadModeSwitch.setTextSize(14);
         touchpadModeSwitch.setPadding(0, dp(8), 0, 0);
-        touchpadModeSwitch.setChecked(prefs.getBoolean(KEY_TOUCHPAD_MODE, false));
+        touchpadModeSwitch.setChecked(prefs.getBoolean(KEY_TOUCHPAD_MODE, true));
         touchpadModeSwitch.setOnCheckedChangeListener((v, checked) ->
                 getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
                         .putBoolean(KEY_TOUCHPAD_MODE, checked).apply());
@@ -567,7 +567,7 @@ public class SettingsActivity extends Activity {
 
         SeekBar accelSeek = new SeekBar(this);
         accelSeek.setMax(190); // 0.5 ~ 10.0 step 0.05
-        float curAccel = prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f);
+        float curAccel = prefs.getFloat(KEY_MOUSE_ACCEL, 1.5f);
         curAccel = Math.max(0.5f, Math.min(10.0f, curAccel));
         accelSeek.setProgress((int)((curAccel - 0.5f) / 0.05f));
         accelValue.setText(getString(R.string.mouse_accel_value, curAccel));

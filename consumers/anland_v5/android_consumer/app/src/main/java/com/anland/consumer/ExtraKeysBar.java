@@ -46,7 +46,7 @@ public class ExtraKeysBar extends GridLayout {
     }
 
     // evdev keycodes (linux/input-event-codes.h)
-    private static final int EV_ESC = 1, EV_TAB = 15, EV_DELETE = 111;
+    private static final int EV_ESC = 1, EV_TAB = 15, EV_DELETE = 111, EV_BACKSPACE = 14;
     private static final int EV_HOME = 102, EV_END = 107, EV_PAGEUP = 104, EV_PAGEDOWN = 109;
     private static final int EV_UP = 103, EV_DOWN = 108, EV_LEFT = 105, EV_RIGHT = 106;
     private static final int EV_LEFTCTRL = 29, EV_LEFTSHIFT = 42, EV_LEFTALT = 56;
@@ -120,6 +120,7 @@ public class ExtraKeysBar extends GridLayout {
         "    [\n" +
         "      {\"label\":\"C\",    \"type\":\"key\",      \"code\":46},\n" +
         "      {\"label\":\"V\",    \"type\":\"key\",      \"code\":47},\n" +
+        "      {\"label\":\"BS\",   \"type\":\"key\",      \"code\":14, \"repeat\":true},\n" +
         "      {\"label\":\"Enter\",\"type\":\"key\",      \"code\":28}\n" +
         "    ]\n" +
         "  ]\n" +
@@ -263,6 +264,7 @@ public class ExtraKeysBar extends GridLayout {
             {
                 Key.key("C", 46),
                 Key.key("V", 47),
+                Key.rep("BS", EV_BACKSPACE),
                 Key.key("Enter", 28),
             },
         };
