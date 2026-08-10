@@ -137,6 +137,10 @@ public class MainActivity extends Activity
     public static final String KEY_MOVE_THRESHOLD = "touchpad_move_threshold";
     // Magnifies declined gestures forwarded as touch; see Touchpad.setGestureScale.
     public static final String KEY_GESTURE_SCALE = "touchpad_gesture_scale";
+    // self-use 个性化：禁用双指捏合/张开与三指及以上的触摸转发手势（缩放等），
+    // 默认开启。双指滚动与双指右键点击不受影响。
+    public static final String KEY_DISABLE_MULTI_FINGER_GESTURES =
+            "disable_multi_finger_gestures";
     // Capture an external mouse/touchpad as a relative pointer so it cannot reach
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
@@ -510,7 +514,7 @@ public class MainActivity extends Activity
         mRoot = root;
         mDensity = getResources().getDisplayMetrics().density;
         mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getBoolean(KEY_KEYBOARD_FLOATING, false);
+            .getBoolean(KEY_KEYBOARD_FLOATING, true);
         buildExtraKeysBar();
 
         // ADDED: Create VirtualKeyboardView (hidden initially)
@@ -796,6 +800,8 @@ public class MainActivity extends Activity
                         Touchpad.DEFAULT_MOVE_THRESHOLD_FACTOR));
         pad.setGestureScale(prefs.getFloat(KEY_GESTURE_SCALE,
                 Touchpad.DEFAULT_GESTURE_SCALE));
+        pad.setMultiFingerGesturesDisabled(
+                prefs.getBoolean(KEY_DISABLE_MULTI_FINGER_GESTURES, true));
     }
 
     /**
@@ -1497,7 +1503,7 @@ public class MainActivity extends Activity
         // Pick up a Keyboard-floating toggle made in Settings: update the bar's
         // backdrop and re-run the layout so the surface margin tracks the new mode.
         mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getBoolean(KEY_KEYBOARD_FLOATING, false);
+            .getBoolean(KEY_KEYBOARD_FLOATING, true);
         if (extraKeysBar != null)
             extraKeysBar.setFloating(mKeyboardFloating);
         relayout();
