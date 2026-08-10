@@ -99,7 +99,7 @@
     <string name="gesture_scale_hint">Gestures forwarded as touch (pinch, three or more fingers) are mapped into a square of this size centred on the pointer. Larger values make the same finger movement travel further.</string>
     <!-- self-use: disable pinch / multi-finger touch gestures -->
     <string name="disable_multi_finger_switch">Disable pinch and multi-finger gestures</string>
-    <string name="disable_multi_finger_hint">ON (self-use default): two-finger pinch/zoom and three-or-more-finger gestures are swallowed and never reach the desktop; two-finger scrolling and two-finger right-click still work. OFF: pinch and multi-finger gestures are forwarded to the desktop as touch.</string>
+    <string name="disable_multi_finger_hint">ON: two-finger pinch/zoom and three-or-more-finger gestures are swallowed and never reach the desktop; two-finger scrolling and two-finger right-click still work. OFF: pinch and multi-finger gestures are forwarded to the desktop as touch.</string>
 
     <!-- Connection -->
     <string name="socket_path_label">Daemon socket path</string>
