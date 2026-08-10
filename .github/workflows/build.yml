@@ -30,13 +30,23 @@ jobs:
       - name: Set NDK_DIR environment variable
         run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
 
-      - name: Generate debug keystore
+      # Restore the SAME keystore used for local builds so that CI-built APKs
+      # share the signature with locally-built ones and can be installed over
+      # them without uninstalling first. The keystore is stored base64-encoded
+      # in the ANLAND_KEYSTORE_BASE64 repository secret (alias androiddebugkey,
+      # store/key password "android", matching AGP's default debug keystore).
+      - name: Restore debug keystore from secret
         run: |
           mkdir -p $HOME/.android
-          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug, O=Android, C=US" -noprompt
+          echo "${{ secrets.ANLAND_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/debug.keystore
+          ls -l $HOME/.android/debug.keystore
+
+      - name: Verify keystore
+        run: |
+          test -s $HOME/.android/debug.keystore || { echo "::error::ANLAND_KEYSTORE_BASE64 secret is empty or not set"; exit 1; }
+          keytool -list -keystore $HOME/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1 \
+            || { echo "::error::Invalid keystore restored from ANLAND_KEYSTORE_BASE64"; exit 1; }
+          echo "Keystore OK: $(keytool -list -keystore $HOME/.android/debug.keystore -storepass android -alias androiddebugkey 2>/dev/null | grep -i sha1)"
 
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
