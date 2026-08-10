@@ -4,7 +4,7 @@
 
     <!-- Titles / section headers -->
     <string name="settings_title">Settings</string>
-    <string name="section_virtual_keyboard">Virtual Keyboard Key</string>
+    <string name="section_virtual_keyboard">Soft Keyboard Toggle Key</string>
     <string name="section_extra_keys">Extra Keys Bar</string>
     <string name="section_custom_layout">Custom Extra Keys Layout</string>
     <string name="section_touchpad">Touchpad Settings</string>
@@ -15,35 +15,60 @@
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ Back</string>
     <string name="cat_keyboard_title">Keyboard &amp; Keys</string>
-    <string name="cat_keyboard_subtitle">Key binding, accessibility &amp; extra keys bar</string>
+    <string name="cat_keyboard_subtitle">Key binding, immersive mode, accessibility &amp; extra keys bar</string>
     <string name="cat_touchpad_title">Touchpad &amp; Mouse</string>
-    <string name="cat_touchpad_subtitle">Touchpad mode &amp; pointer sensitivity</string>
+    <string name="cat_touchpad_subtitle">Touchpad mode, pointer capture &amp; sensitivity</string>
     <string name="cat_connection_subtitle">Socket, root, mic, camera &amp; audio latency</string>
     <string name="cat_resolution_subtitle">Output resolution &amp; presets</string>
     <string name="cat_general_title">General</string>
-    <string name="cat_general_subtitle">Settings notification</string>
+    <string name="cat_general_subtitle">Screen orientation &amp; settings notification</string>
+
+    <!-- Screen orientation -->
+    <string name="section_orientation">Screen Orientation</string>
+    <string name="orientation_label">Force screen orientation</string>
+    <string-array name="orientation_options">
+        <item>Default (system)</item>
+        <item>Force landscape</item>
+        <item>Force portrait</item>
+    </string-array>
 
     <!-- Bind key -->
-    <string name="bind_key_button">Bind Virtual Keyboard Key</string>
+    <string name="bind_key_button">Bind Soft Keyboard Toggle Key</string>
+    <string name="raise_desktop_for_soft_keyboard">Raise desktop when soft keyboard opens</string>
+    <string name="raise_desktop_for_soft_keyboard_hint">When on, the desktop shrinks and moves up so you can see what you type.</string>
     <string name="listening_countdown">Listening… (%1$ds)</string>
     <string name="status_current_none">Current: None</string>
     <string name="status_current">Current: %1$s</string>
+    <string name="status_current_no_scancode">Current: %1$s — this key reports no scan code, so immersive mode cannot use it. Bind a hardware key such as Volume Up.</string>
     <string name="keycode_unknown">Keycode %1$d</string>
+    <string name="scancode_unknown">Scan code %1$d</string>
+
+    <!-- Immersive mode -->
+    <string name="section_immersive">Immersive Mode (Experimental)</string>
+    <string name="immersive_switch">Enable Immersive Mode (Experimental)</string>
+    <string name="immersive_hint">Sends touch, keyboard and mouse input directly to the Linux desktop, keeping Android gestures out of the way. Requires root. Set a toggle key below: press it once to enter and again to exit. The mode also ends when you switch apps.</string>
+    <string name="bind_immersive_key_button">Bind Immersive Mode Key</string>
+    <string name="immersive_entering">Immersive mode: all input goes to the desktop. Press %1$s again to leave.</string>
+    <string name="immersive_exited">Immersive mode off</string>
+    <string name="immersive_no_scancode">Bind a key for immersive mode first</string>
+    <string name="immersive_failed">Could not start immersive mode: root was denied or is unavailable</string>
+    <string name="immersive_no_devices">Could not start immersive mode: no input device could be taken over</string>
+    <string name="immersive_interrupted">Immersive mode ended; input returned to Android</string>
 
     <!-- Accessibility -->
     <string name="accessibility_switch">Accessibility Key Interception</string>
-    <string name="accessibility_hint">Intercept function keys (Fn, F1-F12 etc.) via AccessibilityService. Enable this if external keyboard Fn combos don\'t reach the desktop. Requires Accessibility permission granted in system Settings &gt; Accessibility (one-time).</string>
+    <string name="accessibility_hint">Intercept function keys (Fn, F1-F12 etc.) via AccessibilityService and convert tablet-keyboard Back/Browser Back to ESC. Enable this if external keyboard Fn combos or ESC don\'t reach the desktop correctly. Requires Accessibility permission granted in system Settings &gt; Accessibility (one-time).</string>
 
     <!-- Extra keys bar -->
-    <string name="extra_keys_switch">Extra Keys Bar (special keys)</string>
-    <string name="extra_keys_hint">Show a Termux-style bottom bar with ESC/TAB/CTRL/ALT/arrows/PgUp etc. The display area shrinks to make room; the bar rises together with the soft keyboard. Takes effect on next return to the desktop view.</string>
-    <string name="auto_show_switch">Auto-show extra keys with keyboard</string>
-    <string name="auto_show_hint">When ON, extra keys bar appears automatically with the soft keyboard and hides when it closes. When OFF, bar stays visible until manually toggled via settings.</string>
-    <string name="back_opens_switch">Back key opens extra keys bar</string>
-    <string name="back_opens_hint">When ON, pressing Back while the extra keys bar is hidden shows it; pressing Back again hides it. Use this to reach the extra keys without first opening the soft keyboard.</string>
-    <string name="keyboard_floating_switch">Keyboard floating (overlay display)</string>
-    <string name="keyboard_floating_hint">When ON, the soft keyboard and the extra keys bar float over the display area instead of shrinking it; the bar uses a translucent background and rises with the keyboard, but the display is not resized. When OFF, the original behaviour (display shrinks to make room) is kept. Takes effect on next return to the desktop.</string>
-
+    <string name="extra_keys_mode_label">Extra keys bar mode</string>
+    <string name="extra_keys_mode_hint">Controls when the Termux-style bottom bar with ESC/TAB/CTRL/ALT/arrows/PgUp etc. is shown. Takes effect on next return to the desktop view.</string>
+    <string-array name="extra_keys_mode_options">
+        <item>Always show</item>
+        <item>Never show</item>
+        <item>Show with soft keyboard</item>
+    </string-array>
+    <string name="back_opens_switch">Back key quickly toggles extra keys bar</string>
+    <string name="back_opens_hint">When ON, pressing Back while the extra keys bar is hidden shows it; pressing Back again hides it.</string>
     <!-- Custom layout editor -->
     <string name="btn_load_default">Load default template</string>
     <string name="btn_load_file">Load from file…</string>
@@ -55,17 +80,37 @@
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">Touchpad Mode (relative movement)</string>
     <string name="touchpad_hint">ON: finger slides move mouse cursor (relative). OFF: touch maps directly to screen (absolute).</string>
-    <string name="mouse_sensitivity_label">Mouse Sensitivity (Acceleration)</string>
+    <string name="pointer_capture_switch">Capture external pointer</string>
+    <string name="pointer_capture_hint">Locks an external mouse or touchpad to the desktop view and uses relative movement, so reaching the top or bottom edge will not reveal Android system bars. Use Android Back to release temporarily; click the desktop view to capture again. Screen touch input is unaffected.</string>
+    <string name="pointer_capture_released">External pointer released. Click the desktop view to capture it again.</string>
+    <string name="mouse_sensitivity_label">Touchpad Pointer Sensitivity (Acceleration)</string>
     <string name="mouse_accel_value">%1$.1fx</string>
+    <string name="scroll_reverse_switch">Reverse scroll direction</string>
+    <string name="scroll_reverse_hint">ON: content follows your fingers ("natural" scrolling). Applies to two-finger scrolling on both the on-screen and the physical touchpad.</string>
+    <string name="scroll_speed_label">Two-finger scroll speed</string>
+    <string name="scroll_speed_value">%1$.2f</string>
+    <string name="threshold_factor_value">%1$.2f× touch slop</string>
+    <string name="scroll_threshold_label">Scroll detection threshold</string>
+    <string name="scroll_threshold_hint">How far a finger must travel before it counts as moving. Lower this if a pinch is being treated as a scroll.</string>
+    <string name="move_threshold_label">Gesture commit threshold</string>
+    <string name="move_threshold_hint">How far the leading finger must travel before an ambiguous two-finger gesture is resolved. Lower this if scrolling is slow to engage.</string>
+    <string name="gesture_scale_label">Gesture magnitude</string>
+    <string name="gesture_scale_value">%1$.0f px</string>
+    <string name="gesture_scale_hint">Gestures forwarded as touch (pinch, three or more fingers) are mapped into a square of this size centred on the pointer. Larger values make the same finger movement travel further.</string>
 
     <!-- Connection -->
     <string name="socket_path_label">Daemon socket path</string>
+    <string name="second_window_label">Open a second window (own daemon &amp; title)</string>
+    <string name="second_window_name_hint">Window name (e.g. work)</string>
+    <string name="second_window_open">Open second window</string>
     <string name="root_switch">Connect with root (helper)</string>
     <string name="root_hint">Launches a root helper (su) that connects to the socket and passes the connection back to the app. Takes effect on next connect (reopen the app).</string>
     <string name="mic_switch">Forward microphone to desktop</string>
     <string name="mic_hint">Desktop audio always plays through this device\'s speaker. Enabling this also sends the mic the other way. Takes effect on next connect (reopen the app).</string>
     <string name="camera_switch">Forward camera to desktop</string>
     <string name="camera_hint">Lets the desktop open this device\'s camera(s) as a video source. The camera only turns on while the desktop is actively recording. Takes effect on next return to the app; first use prompts for the camera permission.</string>
+    <string name="audio_keepalive_switch">Audio keep-alive</string>
+    <string name="audio_keepalive_hint">Keep the audio output stream running so short Linux sounds (volume ticks, key clicks) always play instantly. Costs a little standby power. Off: the audio path sleeps after ~1.5 s of desktop silence and wakes for the next sound. If the audible latency does not match your preference, you may need to tune the Audio latency presets below.</string>
     <string name="audio_latency_title">Audio latency</string>
     <string name="latency_speaker_label">Speaker (desktop → phone)</string>
     <string name="latency_mic_label">Microphone (phone → desktop)</string>
@@ -75,6 +120,8 @@
     <string name="width_hint">Width (e.g. 1920)</string>
     <string name="height_hint">Height (e.g. 1080)</string>
     <string name="resolution_hint">Pick a preset or enter values manually. Leave 0 for native resolution. \"Screen ×\" scales this device\'s panel (landscape). Takes effect on next connect.</string>
+    <string name="auto_stretch_switch">Auto-stretch display</string>
+    <string name="auto_stretch_hint">When ON, the display fills the screen (stretched if needed). When OFF, the display maintains the custom resolution aspect ratio with black bars (letterboxing). Input coordinates are automatically mapped.</string>
 
     <!-- Settings notification -->
     <string name="notification_switch">Show settings notification</string>
