@@ -286,6 +286,14 @@ public class MainActivity extends Activity
             else {
                 clearPointerCaptureBackTracking();
                 releasePointerCapture(false);
+                // A freeform / small-window IME floats and can be dismissed by
+                // tapping outside the window with no WindowInsets change, so the
+                // extra-keys bar would stay up. Sync it with the keyboard state
+                // here; SystemIME's toggle flag is reconciled at the same time so
+                // the next toggle press acts on the real state.
+                if (systemIme != null)
+                    systemIme.markImeVisible(false);
+                setExtraKeysBarVisible(shouldShowBar(false));
             }
         }
         // Losing focus means something else is on screen (a system dialog, a
@@ -1711,6 +1719,11 @@ public class MainActivity extends Activity
         boolean wasImeVisible = mImeBottom > 0;
     
         mImeBottom = newImeBottom;
+        // Reconcile SystemIME's toggle flag with the insets-backed reality. In
+        // fullscreen mode this corrects it whenever the IME was dismissed by the
+        // system (tap outside, IME close button) instead of by our toggle.
+        if (systemIme != null)
+            systemIme.markImeVisible(imeVisible);
     
         // Only "with_keyboard" mode tracks the IME; "always"/"never"
         // let the user's manual toggle (back key) stay untouched.

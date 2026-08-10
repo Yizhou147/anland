@@ -59,6 +59,16 @@ public final class SystemIME {
     private EditText hiddenInput;
     /** Incremented whenever a pending show becomes obsolete (for example, hide). */
     private int showRequestId;
+    /**
+     * Whether the IME was last toggled to visible. In freeform / small-window
+     * mode the IME floats and never touches WindowInsets, so the insets-based
+     * query below alone can never report "visible" there -- that made
+     * toggleSystemKeyboard() always take the show branch and the extra-keys bar
+     * could never be hidden. This flag is the source of truth for the toggle
+     * state and is reconciled with reality by the host when insets change or
+     * the window loses focus (the IME can also be dismissed by the system).
+     */
+    private boolean imeVisible = false;
 
     SystemIME(Activity activity, Host host, Native n) {
         this.activity = activity;
@@ -355,8 +365,28 @@ public final class SystemIME {
     }
 
     boolean isImeVisible() {
+        // The flag is the source of truth for the toggle state: it is the only
+        // thing that reports "visible" in freeform / small-window mode, where
+        // a floating IME never reaches WindowInsets. The insets query stays as
+        // a fallback for fullscreen windows whose IME was opened by the system
+        // rather than by our toggle.
+        if (imeVisible)
+            return true;
         WindowInsets insets = activity.getWindow().getDecorView().getRootWindowInsets();
         return insets != null && insets.isVisible(WindowInsets.Type.ime());
+    }
+
+    /**
+     * Reconcile the toggle flag with reality. The host calls this when the IME
+     * was dismissed by the system rather than by our toggle (insets changed, or
+     * the window lost focus), so the flag and the bar follow the actual state.
+     */
+    void markImeVisible(boolean visible) {
+        if (imeVisible == visible)
+            return;
+        imeVisible = visible;
+        if (!visible)
+            releaseHiddenInput();
     }
 
     void releaseHiddenInput() {
@@ -367,9 +397,15 @@ public final class SystemIME {
     }
 
     private void retryShow(int requestId, int attempt) {
-        if (attempt >= SHOW_RETRY_LIMIT || requestId != showRequestId
-                || !hiddenInput.isEnabled())
+        if (requestId != showRequestId || !hiddenInput.isEnabled())
             return;
+        if (attempt >= SHOW_RETRY_LIMIT) {
+            // Give up on the pending show: the system never displayed the IME,
+            // so neither the flag nor the extra-keys bar may stay up.
+            imeVisible = false;
+            host.onImeVisibilityChanged(false);
+            return;
+        }
         hiddenInput.postDelayed(() -> requestShow(requestId, attempt + 1),
                 SHOW_RETRY_DELAY_MS);
     }
@@ -409,6 +445,7 @@ public final class SystemIME {
         if (imm == null) imm = activity.getSystemService(InputMethodManager.class);
         if (imm == null) return;
         if (isImeVisible()) {
+            imeVisible = false;
             showRequestId++;
             imm.hideSoftInputFromWindow(hiddenInput.getWindowToken(), 0);
             releaseHiddenInput();
@@ -416,6 +453,7 @@ public final class SystemIME {
             // explicitly so it tracks the IME state in all modes.
             host.onImeVisibilityChanged(false);
         } else {
+            imeVisible = true;
             hiddenInput.setEnabled(true);
             hiddenInput.setFocusable(true);
             hiddenInput.setFocusableInTouchMode(true);
