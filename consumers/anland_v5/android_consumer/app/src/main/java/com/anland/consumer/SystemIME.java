@@ -378,15 +378,14 @@ public final class SystemIME {
 
     /**
      * Reconcile the toggle flag with reality. The host calls this when the IME
-     * was dismissed by the system rather than by our toggle (insets changed, or
-     * the window lost focus), so the flag and the bar follow the actual state.
+     * was dismissed by the system rather than by our toggle (e.g. the window
+     * lost focus in freeform mode). Only the flag is touched: releaseHiddenInput
+     * must stay exclusive to the hide toggle, because disabling the hidden input
+     * here would abort an in-flight show request.
      */
     void markImeVisible(boolean visible) {
-        if (imeVisible == visible)
-            return;
-        imeVisible = visible;
-        if (!visible)
-            releaseHiddenInput();
+        if (imeVisible != visible)
+            imeVisible = visible;
     }
 
     void releaseHiddenInput() {
@@ -397,15 +396,9 @@ public final class SystemIME {
     }
 
     private void retryShow(int requestId, int attempt) {
-        if (requestId != showRequestId || !hiddenInput.isEnabled())
+        if (attempt >= SHOW_RETRY_LIMIT || requestId != showRequestId
+                || !hiddenInput.isEnabled())
             return;
-        if (attempt >= SHOW_RETRY_LIMIT) {
-            // Give up on the pending show: the system never displayed the IME,
-            // so neither the flag nor the extra-keys bar may stay up.
-            imeVisible = false;
-            host.onImeVisibilityChanged(false);
-            return;
-        }
         hiddenInput.postDelayed(() -> requestShow(requestId, attempt + 1),
                 SHOW_RETRY_DELAY_MS);
     }

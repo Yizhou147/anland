@@ -1719,10 +1719,11 @@ public class MainActivity extends Activity
         boolean wasImeVisible = mImeBottom > 0;
     
         mImeBottom = newImeBottom;
-        // Reconcile SystemIME's toggle flag with the insets-backed reality. In
-        // fullscreen mode this corrects it whenever the IME was dismissed by the
-        // system (tap outside, IME close button) instead of by our toggle.
-        if (systemIme != null)
+        // Reconcile SystemIME's toggle flag with the insets-backed reality, but
+        // only when the insets actually changed: in freeform / small-window mode
+        // a floating IME keeps the insets at 0, so this never fires there and
+        // the flag stays under the toggle's control.
+        if (systemIme != null && imeVisible != wasImeVisible)
             systemIme.markImeVisible(imeVisible);
     
         // Only "with_keyboard" mode tracks the IME; "always"/"never"
