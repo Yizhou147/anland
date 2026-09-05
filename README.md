@@ -1,5 +1,10 @@
 # Anland Display Protocol V3
 
+<p align="left">
+  <img src="doc/logo.png" width="140" alt="Anland logo" />
+  <img src="https://stone.professorlee.work/api/stone/superturtlee/anland" alt="Stone Badge" />
+</p>
+
 > A buffer‑sharing protocol that lets a Linux compositor (KWin / Weston) render its
 > desktop into GPU buffers that an Android surface presents, brokered by a small
 > daemon over a Unix domain socket.
@@ -11,6 +16,13 @@
 > handle all event types or explicitly drain unhandled variable‑length payloads.
 
 > **[中文版](README_zh.md)**
+
+---
+
+## User documentation
+
+- [Anland User Guide](doc/UserManual/anland_guide.md) - install Anland and connect a supported Wayland desktop through chroot or Droidspaces.
+- [Anland Settings Guide](doc/UserManual/anland_settings_guide.md) - configure input, display, connection, audio, and window behavior in the Android app.
 
 ---
 
