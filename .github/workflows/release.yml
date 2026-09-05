@@ -11,6 +11,9 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/build.yml
+    # Pass repository secrets (e.g. ANLAND_KEYSTORE_BASE64) to the called
+    # workflow; without this they are not forwarded on workflow_call.
+    secrets: inherit
 
   release:
     needs: build
