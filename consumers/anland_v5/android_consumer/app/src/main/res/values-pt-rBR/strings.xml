@@ -99,8 +99,6 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">Interceptação das Teclas via Acessibilidade</string>
     <string name="accessibility_hint">Intercepta as teclas de função (Fn, F1-F12 etc.) via AccessibilityService e converte o Voltar do teclado de tablet/Voltar do navegador em ESC. Ative isso se combinações Fn ou o ESC de um teclado externo não estiverem chegando corretamente ao desktop. Requer a permissão de Acessibilidade concedida em Configurações do sistema &gt; Acessibilidade (uma única vez).</string>
-    <!-- Extra keys bar -->
-    <!-- Custom layout editor -->
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">Modo Touchpad (movimento relativo)</string>
     <string name="touchpad_hint">Ativado: dedo move o cursor do mouse (relativo). Desativado: touch é mapeado direto para a tela (absoluto).</string>

@@ -200,9 +200,6 @@
     <string name="accessibility_switch">Accessibility Key Interception</string>
     <string name="accessibility_hint">Intercept function keys (Fn, F1-F12 etc.) via AccessibilityService and convert tablet-keyboard Back/Browser Back to ESC. Enable this if external keyboard Fn combos or ESC don\'t reach the desktop correctly. Requires Accessibility permission granted in system Settings &gt; Accessibility (one-time).</string>
 
-    <!-- Extra keys bar -->
-    <!-- Custom layout editor -->
-
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">Touchpad Mode (relative movement)</string>
     <string name="touchpad_hint">ON: finger slides move mouse cursor (relative). OFF: touch maps directly to screen (absolute).</string>

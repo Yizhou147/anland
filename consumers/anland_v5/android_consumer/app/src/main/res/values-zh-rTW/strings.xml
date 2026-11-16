@@ -101,8 +101,6 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">無障礙按鍵攔截</string>
     <string name="accessibility_hint">透過無障礙服務攔截功能鍵（Fn、F1-F12 等），並將平板鍵盤回報的返回／瀏覽器上一頁鍵轉換為 ESC。如果外接鍵盤的 Fn 組合鍵或 ESC 無法正確傳到桌面，請啟用此項。需要在系統 設定 &gt; 無障礙 中授予無障礙權限（僅需一次）。</string>
-    <!-- Extra keys bar -->
-    <!-- Custom layout editor -->
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">觸控板模式（相對移動）</string>
     <string name="touchpad_hint">開啟：手指滑動移動滑鼠游標（相對）。關閉：觸控直接對應到螢幕（絕對）。</string>

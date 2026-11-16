@@ -99,8 +99,6 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">접근성 키 가로채기</string>
     <string name="accessibility_hint">AccessibilityService를 통해 기능 키(Fn, F1-F12 등)를 가로채고, 태블릿 키보드의 뒤로가기/브라우저 뒤로가기를 ESC로 변환합니다. 외부 키보드의 Fn 조합이나 ESC가 데스크톱에 제대로 전달되지 않는다면 이 옵션을 활성화하세요. 시스템 설정 &gt; 접근성에서 접근성 권한을 한 번 허용해야 합니다.</string>
-    <!-- Extra keys bar -->
-    <!-- Custom layout editor -->
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">터치패드 모드 (상대 좌표 이동)</string>
     <string name="touchpad_hint">켜짐: 손가락을 움직이면 마우스 커서가 이동합니다 (상대 좌표). 꺼짐: 터치한 위치가 화면 좌표에 그대로 대응됩니다 (절대 좌표).</string>
