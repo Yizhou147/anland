@@ -63,6 +63,13 @@ jobs:
             || { echo "::error::Invalid keystore restored from ANLAND_KEYSTORE_BASE64"; exit 1; }
           echo "Keystore OK: $(keytool -list -keystore $HOME/.android/debug.keystore -storepass android -alias androiddebugkey 2>/dev/null | grep -i sha1)"
 
+      - name: Run Android unit tests
+        if: matrix.task == 'assemblePlainRelease'
+        working-directory: consumers/anland_v5/android_consumer
+        run: |
+          chmod +x gradlew
+          ./gradlew testPlainDebugUnitTest
+
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
         run: |

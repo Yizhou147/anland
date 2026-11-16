@@ -1,6 +1,10 @@
 package com.anland.consumer;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+
+import org.json.JSONObject;
+import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
@@ -11,6 +15,7 @@ import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.text.Editable;
+import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.text.InputType;
 import android.util.Log;
@@ -18,11 +23,13 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -32,9 +39,18 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+
+
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
 
 public class SettingsActivity extends Activity {
@@ -52,15 +68,19 @@ public class SettingsActivity extends Activity {
     private static final String KEY_IMMERSIVE_ENABLED = ImmersiveMode.KEY_ENABLED;
     private static final String KEY_IMMERSIVE_KEYCODE = ImmersiveMode.KEY_KEYCODE;
     private static final String KEY_IMMERSIVE_SCANCODE = ImmersiveMode.KEY_SCANCODE;
-    private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
-    // Mapped to R.array.extra_keys_mode_options positions
-    private static final String MODE_ALWAYS = "always";
-    private static final String MODE_NEVER = "never";
-    private static final String MODE_WITH_KEYBOARD = "with_keyboard";
-    private static final String[] EXTRA_KEYS_MODES = {MODE_ALWAYS, MODE_NEVER, MODE_WITH_KEYBOARD};
-    private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
-    private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    private static final String KEY_OPLUS_REFRESH_RATE_LOCK =
+            OplusRefreshRateLease.KEY_ENABLED;
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
+    private static final String KEY_LANDSCAPE_SPLIT_ARC =
+            VirtualKeyboardView.KEY_LANDSCAPE_SPLIT_ARC;
+    private static final String KEY_KEYBOARD_HANDEDNESS =
+            VirtualKeyboardView.KEY_KEYBOARD_HANDEDNESS;
+    private static final String KEY_KEYBOARD_THEME = VirtualKeyboardView.KEY_KEYBOARD_THEME;
+    private static final String KEY_HAPTIC_FEEDBACK = VirtualKeyboardView.KEY_HAPTIC_FEEDBACK;
+    private static final String KEY_SPLIT_ARC_TOP_WINGS =
+            VirtualKeyboardView.KEY_SPLIT_ARC_TOP_WINGS;
+    private static final String KEY_USE_HUD_OVERLAY = "use_hud_overlay";
+    private static final String KEY_HUD_LAYOUT_PROFILE = "hud_layout_profile_v2";
     private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
     private static final String KEY_ORIENTATION = "screen_orientation";
     private static final String[] ORIENTATION_VALUES = {"default", "landscape", "portrait"};
@@ -79,27 +99,68 @@ public class SettingsActivity extends Activity {
     // self-use 个性化：禁用双指开合与多指手势（默认开启）
     private static final String KEY_DISABLE_MULTI_FINGER_GESTURES =
             "disable_multi_finger_gestures";
+    private static final String KEY_PAD_TAP = "pad_tap";
+    private static final String KEY_PAD_SCROLL_GUARD_MS = "pad_scroll_guard_ms";
+    private static final String KEY_PAD_DEBUG = "pad_debug";
 
     // Latency presets: target buffer in ms (0 = auto). The user-visible labels live
     // in the R.array.latency_labels string-array, parallel to this array.
     private static final int[] LATENCY_MS = {0, 1, 3, 5, 10, 20};
 
-    // Which secondary page is on screen. Back returns HOME -> exits the activity.
-    private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL }
+    // Which secondary page is on screen. Back walks up to the parent page;
+    // Back from HOME exits the activity.
+    private enum Page {
+        HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL,
+        IMMERSIVE, IMMERSIVE_INPUTS
+    }
     private Page currentPage = Page.HOME;
+
+    /**
+     * Where Back goes from each page. Immersive inputs is reached from the
+     * Immersive page, so it returns there rather than all the way home.
+     */
+    private static Page parentOf(Page page) {
+        if (page == Page.IMMERSIVE_INPUTS)
+            return Page.IMMERSIVE;
+        return Page.HOME;
+    }
+
+    /**
+     * Bumped whenever the immersive-inputs page is rebuilt. The discovery and
+     * status lookups are asynchronous, and an answer that arrives after the user
+     * has left the page must not touch the view hierarchy it was built for.
+     */
+    private int immersivePageToken;
+
+    /**
+     * The last discovery and occupancy answers, kept so the rows can be redrawn
+     * the moment a setting changes. Without them, flipping "choose automatically"
+     * would save the preference and leave the checkboxes exactly as they were —
+     * disabled — until the user left the page and came back.
+     */
+    private List<InputGrab.DiscoveredDevice> immersiveDevices;
+    private GoldInputStatusClient.Result immersiveGold;
 
     // The key-binding row currently counting down, if any: it gets the next key
     // press. The rows themselves live in the page's view hierarchy.
     private KeyBinding listeningBinding;
 
     // Custom extra-keys layout editor (JSON), and the SAF file-picker request code.
-    private EditText layoutInput;
-    private static final int REQ_PICK_LAYOUT = 2001;
+    private static final int REQ_EXPORT_HUD_LAYOUT = 2002;
+    private static final int REQ_IMPORT_HUD_LAYOUT = 2003;
+    private String pendingHudExport;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (savedInstanceState != null) pendingHudExport = savedInstanceState.getString("pending_hud_export");
         showHome();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putString("pending_hud_export", pendingHudExport);
     }
 
     // ============================================================
@@ -155,6 +216,8 @@ public class SettingsActivity extends Activity {
             R.string.cat_connection_subtitle, this::showConnectionPage);
         addCategoryRow(root, R.string.section_resolution,
             R.string.cat_resolution_subtitle, this::showResolutionPage);
+        addCategoryRow(root, R.string.cat_immersive_title,
+            R.string.cat_immersive_subtitle, this::showImmersivePage);
         addCategoryRow(root, R.string.cat_general_title,
             R.string.cat_general_subtitle, this::showGeneralPage);
 
@@ -233,7 +296,7 @@ public class SettingsActivity extends Activity {
         back.setTextColor(0xFF1565C0);
         back.setPadding(0, 0, 0, dp(12));
         back.setClickable(true);
-        back.setOnClickListener(v -> showHome());
+        back.setOnClickListener(v -> showPage(parentOf(currentPage)));
         root.addView(back);
 
         TextView title = new TextView(this);
@@ -247,14 +310,26 @@ public class SettingsActivity extends Activity {
         return root;
     }
 
+    /** Dispatches to a page by enum, for nested Back navigation. */
+    private void showPage(Page page) {
+        switch (page) {
+            case KEYBOARD: showKeyboardPage(); break;
+            case TOUCHPAD: showTouchpadPage(); break;
+            case CONNECTION: showConnectionPage(); break;
+            case RESOLUTION: showResolutionPage(); break;
+            case GENERAL: showGeneralPage(); break;
+            case IMMERSIVE: showImmersivePage(); break;
+            case IMMERSIVE_INPUTS: showImmersiveInputsPage(); break;
+            case HOME:
+            default: showHome(); break;
+        }
+    }
+
     private void showKeyboardPage() {
         currentPage = Page.KEYBOARD;
         LinearLayout root = newPage(R.string.cat_keyboard_title);
         buildVirtualKeyboardSection(root);
-        buildImmersiveSection(root);
         buildAccessibilitySection(root);
-        buildExtraKeysSection(root);
-        buildCustomLayoutSection(root);
         setContent(root);
     }
 
@@ -276,6 +351,7 @@ public class SettingsActivity extends Activity {
         currentPage = Page.RESOLUTION;
         LinearLayout root = newPage(R.string.section_resolution);
         addResolutionSection(root);
+        addHdrSection(root);
         setContent(root);
     }
 
@@ -287,13 +363,423 @@ public class SettingsActivity extends Activity {
         setContent(root);
     }
 
+    // ============================================================
+    // Immersive page and its input-source page
+    // ============================================================
+
+    private void showImmersivePage() {
+        currentPage = Page.IMMERSIVE;
+        LinearLayout root = newPage(R.string.cat_immersive_title);
+        buildImmersiveSection(root);
+        addCategoryRow(root, R.string.immersive_inputs_title,
+            R.string.immersive_inputs_subtitle, this::showImmersiveInputsPage);
+        setContent(root);
+    }
+
+    private void showImmersiveInputsPage() {
+        currentPage = Page.IMMERSIVE_INPUTS;
+        // Any lookup still in flight belongs to the page being replaced, and the
+        // answers it was going to fill in belong to it too.
+        final int token = ++immersivePageToken;
+        immersiveDevices = null;
+        immersiveGold = null;
+
+        LinearLayout root = newPage(R.string.immersive_inputs_title);
+        addSectionHeader(root, R.string.section_immersive_inputs_source, dp(8));
+
+        ImmersiveInputSource source = ImmersiveInputSource.read(
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE));
+
+        // Three ways to get input, in the order the string-array lists them.
+        final ImmersiveInputSource[] sources = ImmersiveInputSource.ORDER;
+        int selectedIndex = source.menuIndex();
+
+        Spinner sourcePicker = new Spinner(this);
+        // Which sources need the Gold module, resolved once: it is a device
+        // lookup, not a preference read.
+        final boolean goldAvailable = GoldKeyboard.goldKeyboardPresent(this);
+        final boolean[] sourceUsable = new boolean[sources.length];
+        for (int index = 0; index < sources.length; index++)
+            sourceUsable[index] = sources[index].isAvailable(this);
+        // The unavailable ones stay on the list, greyed and unselectable. An
+        // option that vanished would leave the user wondering where it went;
+        // an option that can be picked but does nothing is worse than both.
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
+            android.R.layout.simple_spinner_item,
+            getResources().getStringArray(R.array.immersive_source_options)) {
+            @Override
+            public boolean isEnabled(int position) {
+                return position >= 0 && position < sourceUsable.length && sourceUsable[position];
+            }
+
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                return greyWhenUnusable(super.getView(position, convertView, parent), position);
+            }
+
+            @Override
+            public View getDropDownView(int position, View convertView, ViewGroup parent) {
+                return greyWhenUnusable(
+                        super.getDropDownView(position, convertView, parent), position);
+            }
+
+            private View greyWhenUnusable(View row, int position) {
+                if (row instanceof TextView)
+                    ((TextView) row).setTextColor(isEnabled(position) ? Color.BLACK : Color.GRAY);
+                row.setEnabled(isEnabled(position));
+                return row;
+            }
+        };
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        sourcePicker.setAdapter(adapter);
+        // Set before the listener, so restoring the stored value does not look
+        // like the user changing it.
+        sourcePicker.setSelection(selectedIndex);
+        root.addView(sourcePicker);
+
+        TextView sourceHint = new TextView(this);
+        sourceHint.setText(sourceHintFor(source));
+        sourceHint.setTextSize(13);
+        sourceHint.setTextColor(Color.GRAY);
+        sourceHint.setPadding(0, 0, 0, dp(8));
+        root.addView(sourceHint);
+
+        // While the panel is grabbed the HUD would otherwise be dead: every
+        // touch goes to the desktop. This lets the on-screen controls stay live.
+        SharedPreferences inputPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        Switch hudTouchSwitch = new Switch(this);
+        hudTouchSwitch.setText(R.string.immersive_hud_touch_switch);
+        hudTouchSwitch.setTextSize(14);
+        hudTouchSwitch.setPadding(0, 0, 0, 0);
+        hudTouchSwitch.setChecked(inputPrefs.getBoolean(ImmersiveMode.KEY_HUD_TOUCH,
+                ImmersiveMode.DEFAULT_HUD_TOUCH));
+        hudTouchSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(ImmersiveMode.KEY_HUD_TOUCH, checked).apply());
+        root.addView(hudTouchSwitch);
+
+        TextView hudTouchHint = new TextView(this);
+        hudTouchHint.setText(R.string.immersive_hud_touch_hint);
+        hudTouchHint.setTextSize(13);
+        hudTouchHint.setTextColor(Color.GRAY);
+        hudTouchHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(hudTouchHint);
+
+        sourcePicker.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (position < 0 || position >= sources.length)
+                    return;
+                ImmersiveInputSource picked = sources[position];
+                // A Spinner applies its selection during layout, not when
+                // setSelection is called, so this fires once for the value the
+                // page was built with as well. Acting on that would rebuild the
+                // page, build another Spinner, and fire again -- a loop that
+                // also spawns a process each time round. Nothing to do unless
+                // the user actually picked something else.
+                if (picked == ImmersiveInputSource.read(
+                        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)))
+                    return;
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(ImmersiveInputSource.KEY_PREFERENCE, picked.preferenceValue)
+                    .apply();
+                // Rebuild so the page describes the source now selected, and
+                // nothing else.
+                showImmersiveInputsPage();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+
+        setContent(root);
+        // Gold output is discovered by identity; only physical nodes need a picker.
+        if (source == ImmersiveInputSource.EXISTING_UINPUT_BUS) {
+            Switch autoEnter = new Switch(this);
+            autoEnter.setText(R.string.immersive_auto_enter);
+            autoEnter.setTextSize(14);
+            autoEnter.setChecked(getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(ImmersiveInputController.KEY_AUTO_ENTER, false));
+            autoEnter.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(ImmersiveInputController.KEY_AUTO_ENTER, checked).apply());
+            root.addView(autoEnter);
+
+            TextView autoHint = new TextView(this);
+            autoHint.setText(R.string.immersive_auto_enter_hint);
+            autoHint.setTextSize(13);
+            autoHint.setTextColor(Color.GRAY);
+            autoHint.setPadding(0, 0, 0, dp(8));
+            root.addView(autoHint);
+
+            addSectionHeader(root, R.string.section_immersive_inputs_scope, dp(16));
+            TextView scope = new TextView(this);
+            scope.setText(R.string.immersive_inputs_bus_scope);
+            scope.setTextSize(13);
+            scope.setTextColor(Color.GRAY);
+            root.addView(scope);
+        } else {
+            buildDirectNodeSection(root, token);
+        }
+    }
+
+    /** The line under the source picker, describing the source it names. */
+    private int sourceHintFor(ImmersiveInputSource source) {
+        switch (source) {
+            case EXISTING_UINPUT_BUS:
+                return R.string.immersive_inputs_bus_hint;
+            case DIRECT_PLUS_GOLD_KEYBOARD:
+                return R.string.immersive_inputs_combined_hint;
+            case DIRECT_EVENT_NODES:
+            default:
+                return R.string.immersive_inputs_direct_blurb;
+        }
+    }
+
+    private void buildDirectNodeSection(LinearLayout root, final int token) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        addSectionHeader(root, R.string.section_immersive_inputs_direct, dp(16));
+
+        Switch autoSwitch = new Switch(this);
+        autoSwitch.setText(R.string.immersive_inputs_auto);
+        autoSwitch.setTextSize(14);
+        autoSwitch.setChecked(ImmersiveInputSource.isAutomatic(prefs));
+        root.addView(autoSwitch);
+
+        final TextView status = new TextView(this);
+        final LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+
+        autoSwitch.setOnCheckedChangeListener((v, checked) -> {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(ImmersiveInputSource.KEY_AUTO, checked).apply();
+            // The rows below are what the setting acts on, so they have to follow
+            // it now — not on the next visit to the page.
+            renderImmersiveInputRows(status, list);
+        });
+
+        TextView directHint = new TextView(this);
+        directHint.setText(R.string.immersive_inputs_direct_hint);
+        directHint.setTextSize(13);
+        directHint.setTextColor(Color.GRAY);
+        root.addView(directHint);
+
+        status.setText(R.string.immersive_inputs_loading);
+        status.setTextSize(13);
+        status.setPadding(0, dp(12), 0, dp(6));
+        root.addView(status);
+        root.addView(list);
+
+        loadImmersiveInputs(token, status, list);
+    }
+
+    /** Redraws the rows from the answers already in hand, without asking again. */
+    private void renderImmersiveInputRows(TextView status, LinearLayout list) {
+        if (immersiveDevices == null)
+            return;
+        showImmersiveInputRows(status, list, immersiveDevices, immersiveGold);
+    }
+
+    /** The device type, in the same terms Gold's own list uses. */
+    private String deviceTypeLabel(InputGrab.DiscoveredDevice device) {
+        switch (device.cls) {
+            case InputGrab.CLASS_TOUCHSCREEN:
+                return getString(R.string.device_class_touchscreen);
+            case InputGrab.CLASS_TOUCHPAD:
+                return getString(R.string.device_class_touchpad);
+            case InputGrab.CLASS_MOUSE:
+                return getString(R.string.device_class_mouse);
+            case InputGrab.CLASS_GAMEPAD:
+                return getString(R.string.device_class_gamepad);
+            case InputGrab.CLASS_KEYBOARD:
+            default:
+                // A node that merely carries a few keys — gpio-keys, a powerkey —
+                // is not the keyboard anyone types on, and labelling it as one
+                // makes the list harder to read than no label at all.
+                return getString(device.alphaKeys
+                    ? R.string.device_class_keyboard
+                    : R.string.device_class_keys);
+        }
+    }
+
+    /** How the device is attached — the same distinction Gold's list draws. */
+    private String deviceBusLabel(InputGrab.DiscoveredDevice device) {
+        switch (device.bus) {
+            case InputGrab.BUS_USB:
+                return getString(R.string.bus_usb);
+            case InputGrab.BUS_BLUETOOTH:
+                return getString(R.string.bus_bluetooth);
+            case InputGrab.BUS_VIRTUAL:
+                return getString(R.string.bus_virtual);
+            case 0:  // panel and platform devices report no bus at all
+            case InputGrab.BUS_I8042:
+            case InputGrab.BUS_HOST:
+                return getString(R.string.bus_builtin);
+            case InputGrab.BUS_I2C:
+                return getString(R.string.bus_i2c);
+            case InputGrab.BUS_SPI:
+                return getString(R.string.bus_spi);
+            default:
+                return getString(R.string.bus_other,
+                    String.format(Locale.ROOT, "%04x", device.bus));
+        }
+    }
+
+    /**
+     * Looks up the nodes and Gold's occupancy off the main thread, then fills the
+     * page in. Both answers are needed before anything can be shown: the nodes to
+     * list, and what Gold holds so those rows can be shown as taken.
+     */
+    private void loadImmersiveInputs(final int token, final TextView status,
+                                     final LinearLayout list) {
+        final Context appContext = getApplicationContext();
+        Thread worker = new Thread(() -> {
+            final List<InputGrab.DiscoveredDevice> devices =
+                InputGrab.discoverDevices(appContext);
+            final GoldInputStatusClient.Result gold = new GoldInputStatusClient(
+                new GoldController(new SuCommand.SuRunner(), GoldController.DEFAULT_CONTROLLER,
+                    new SecureRandom())).query();
+            runOnUiThread(() -> {
+                // The page may have been rebuilt or left while this was in
+                // flight; its views are gone and must not be touched.
+                if (token != immersivePageToken)
+                    return;
+                showImmersiveInputRows(status, list, devices, gold);
+            });
+        }, "anland-immersive-discovery");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void showImmersiveInputRows(TextView status, LinearLayout list,
+                                        List<InputGrab.DiscoveredDevice> devices,
+                                        GoldInputStatusClient.Result gold) {
+        immersiveDevices = devices;
+        immersiveGold = gold;
+        list.removeAllViews();
+
+        if (devices == null) {
+            status.setText(R.string.immersive_inputs_unavailable);
+            return;
+        }
+
+        // Only a verified snapshot may mark anything as Gold's. An unreadable
+        // Gold marks nothing and says so, rather than looking like an idle Gold.
+        //
+        // The whole claimed set, not just the held node: a keyboard offered over
+        // two transports is Gold's whichever one it happens to be holding.
+        Set<String> occupied = new LinkedHashSet<>();
+        if (gold.state == GoldInputStatusClient.State.VERIFIED)
+            occupied.addAll(gold.snapshot.claimed);
+
+        if (gold.state == GoldInputStatusClient.State.UNKNOWN)
+            status.setText(R.string.immersive_inputs_unknown);
+        else if (devices.isEmpty())
+            status.setText(R.string.immersive_inputs_none);
+        else
+            status.setText(R.string.immersive_inputs_found);
+
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean automatic = ImmersiveInputSource.isAutomatic(prefs);
+        Set<String> saved = ImmersiveInputSource.savedNodes(prefs);
+        final Set<String> selected = new TreeSet<>(saved);
+
+        // Power, volume and the other button nodes are not offered at all: they
+        // belong to Android's own wake and volume paths, and a row nobody should
+        // ever tick is worse than no row.
+        List<InputGrab.DiscoveredDevice> visible = new ArrayList<>();
+        for (InputGrab.DiscoveredDevice device : devices) {
+            if (InputGrab.isVisible(device))
+                visible.add(device);
+        }
+        if (visible.isEmpty()) {
+            status.setText(R.string.immersive_inputs_none);
+            return;
+        }
+
+        for (InputGrab.DiscoveredDevice device : visible) {
+            boolean held = occupied.contains(device.node);
+            CheckBox row = new CheckBox(this);
+            String label = device.node + "  ·  " + device.name
+                + "  ·  " + deviceTypeLabel(device)
+                + "  ·  " + deviceBusLabel(device);
+            if (!InputGrab.isSelectable(device)) {
+                row.setText(getString(R.string.immersive_inputs_system_power, label));
+                row.setChecked(false);
+                row.setEnabled(false);
+            } else if (held) {
+                // Gold's. Deliberately not ticked: a tick reads as "you selected
+                // this", which is the opposite of what the row means. It is
+                // marked as unavailable instead.
+                row.setText(getString(R.string.immersive_inputs_occupied, label));
+                row.setChecked(false);
+                row.setEnabled(false);
+            } else if (automatic) {
+                // Show what automatic selection is about to take. Leaving these
+                // blank next to a switch that says "choose automatically" tells
+                // the user nothing about what is going to be taken from Android.
+                row.setText(label);
+                row.setChecked(true);
+                row.setEnabled(false);
+            } else {
+                row.setText(label);
+                row.setChecked(selected.contains(device.node));
+                row.setEnabled(true);
+                row.setOnCheckedChangeListener((v, isChecked) -> {
+                    if (isChecked)
+                        selected.add(device.node);
+                    else
+                        selected.remove(device.node);
+                    saveSelectedNodes(selected);
+                });
+            }
+            list.addView(row);
+        }
+
+        // Saved intent that the current occupancy cannot honour is still the
+        // user's intent. Show the difference; never rewrite what they saved.
+        Set<String> effective = new TreeSet<>(saved);
+        effective.removeAll(occupied);
+        if (!saved.isEmpty() && effective.isEmpty()) {
+            addNote(list, getString(R.string.immersive_inputs_all_filtered));
+        } else if (effective.size() != saved.size()) {
+            addNote(list, getString(R.string.immersive_inputs_remembered,
+                TextUtils.join(", ", new TreeSet<>(saved)),
+                TextUtils.join(", ", effective)));
+        }
+    }
+
+    private void addNote(LinearLayout parent, String text) {
+        TextView note = new TextView(this);
+        note.setText(text);
+        note.setTextSize(13);
+        note.setTextColor(0xFFC62828);
+        note.setPadding(0, dp(12), 0, 0);
+        parent.addView(note);
+    }
+
+    /** Persists the selection sorted, so the stored value never depends on row order. */
+    private void saveSelectedNodes(Set<String> nodes) {
+        StringBuilder value = new StringBuilder();
+        for (String node : new TreeSet<>(nodes)) {
+            if (value.length() > 0)
+                value.append(',');
+            value.append(node);
+        }
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(ImmersiveInputSource.KEY_NODES, value.toString())
+            .apply();
+    }
+
     @Override
     public void onBackPressed() {
         // While listening for a key binding, let onKeyDown capture the Back key
         // instead of navigating back.
         if (listeningBinding != null) return;
         if (currentPage != Page.HOME) {
-            showHome();
+            showPage(parentOf(currentPage));
         } else {
             super.onBackPressed();
         }
@@ -312,6 +798,83 @@ public class SettingsActivity extends Activity {
                 KeyEvent.KEYCODE_BACK);
 
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        Switch splitKeyboardSwitch = new Switch(this);
+        splitKeyboardSwitch.setText(R.string.landscape_split_keyboard);
+        splitKeyboardSwitch.setTextSize(14);
+        splitKeyboardSwitch.setPadding(0, dp(8), 0, 0);
+        splitKeyboardSwitch.setChecked(prefs.getBoolean(KEY_LANDSCAPE_SPLIT_ARC, true));
+        splitKeyboardSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_LANDSCAPE_SPLIT_ARC, checked).apply());
+        root.addView(splitKeyboardSwitch);
+
+        TextView splitKeyboardHint = new TextView(this);
+        splitKeyboardHint.setText(R.string.landscape_split_keyboard_hint);
+        splitKeyboardHint.setTextSize(12);
+        splitKeyboardHint.setTextColor(Color.GRAY);
+        splitKeyboardHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(splitKeyboardHint);
+
+        Button customizeWingsButton = new Button(this);
+        customizeWingsButton.setText(R.string.customize_keyboard_wings);
+        customizeWingsButton.setOnClickListener(v -> KeyboardWingsDialog.show(this, null));
+        root.addView(customizeWingsButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView handednessLabel = new TextView(this);
+        handednessLabel.setText(R.string.keyboard_handedness);
+        handednessLabel.setTextSize(14);
+        handednessLabel.setPadding(0, dp(8), 0, dp(4));
+        root.addView(handednessLabel);
+        Spinner handednessSpinner = new Spinner(this);
+        ArrayAdapter<CharSequence> handednessAdapter = ArrayAdapter.createFromResource(
+                this, R.array.keyboard_handedness_options, android.R.layout.simple_spinner_item);
+        handednessAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        handednessSpinner.setAdapter(handednessAdapter);
+        handednessSpinner.setSelection("right".equals(
+                prefs.getString(KEY_KEYBOARD_HANDEDNESS, "left")) ? 1 : 0);
+        handednessSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(KEY_KEYBOARD_HANDEDNESS, position == 1 ? "right" : "left")
+                    .apply();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        root.addView(handednessSpinner);
+
+        TextView themeLabel = new TextView(this);
+        themeLabel.setText(R.string.keyboard_theme);
+        themeLabel.setTextSize(14);
+        themeLabel.setPadding(0, dp(8), 0, dp(4));
+        root.addView(themeLabel);
+        Spinner themeSpinner = new Spinner(this);
+        ArrayAdapter<CharSequence> themeAdapter = ArrayAdapter.createFromResource(
+                this, R.array.keyboard_theme_options, android.R.layout.simple_spinner_item);
+        themeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        themeSpinner.setAdapter(themeAdapter);
+        themeSpinner.setSelection(Math.max(VirtualKeyboardView.THEME_FILLED,
+                Math.min(VirtualKeyboardView.THEME_TRANSPARENT_FULL,
+                        prefs.getInt(KEY_KEYBOARD_THEME, VirtualKeyboardView.THEME_FILLED))));
+        themeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putInt(KEY_KEYBOARD_THEME, position).apply();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        root.addView(themeSpinner);
+
+        Switch hapticSwitch = new Switch(this);
+        hapticSwitch.setText(R.string.keyboard_haptic_feedback);
+        hapticSwitch.setTextSize(14);
+        hapticSwitch.setPadding(0, dp(8), 0, 0);
+        hapticSwitch.setChecked(prefs.getBoolean(KEY_HAPTIC_FEEDBACK, true));
+        hapticSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_HAPTIC_FEEDBACK, checked).apply());
+        root.addView(hapticSwitch);
+
         Switch raiseDesktopSwitch = new Switch(this);
         raiseDesktopSwitch.setText(R.string.raise_desktop_for_soft_keyboard);
         raiseDesktopSwitch.setTextSize(14);
@@ -328,6 +891,46 @@ public class SettingsActivity extends Activity {
         raiseDesktopHint.setTextColor(Color.GRAY);
         raiseDesktopHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(raiseDesktopHint);
+
+        Switch hudSwitch = new Switch(this);
+        hudSwitch.setText(R.string.hud_controls_switch);
+        hudSwitch.setTextSize(14);
+        hudSwitch.setPadding(0, dp(16), 0, 0);
+        hudSwitch.setChecked(prefs.getBoolean(KEY_USE_HUD_OVERLAY, true));
+        hudSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_USE_HUD_OVERLAY, checked).apply());
+        root.addView(hudSwitch);
+
+        TextView hudHint = new TextView(this);
+        hudHint.setText(R.string.hud_controls_hint);
+        hudHint.setTextSize(12);
+        hudHint.setTextColor(Color.GRAY);
+        hudHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(hudHint);
+
+        Button editHudButton = new Button(this);
+        editHudButton.setText(R.string.hud_edit_layout);
+        editHudButton.setOnClickListener(v -> {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putBoolean(KEY_USE_HUD_OVERLAY, true)
+                    .apply();
+            startActivity(new Intent(this, HudEditorActivity.class));
+        });
+        root.addView(editHudButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button exportHudButton = new Button(this);
+        exportHudButton.setText(R.string.hud_export_layout);
+        exportHudButton.setOnClickListener(v -> exportHudLayout());
+        root.addView(exportHudButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        Button importHudButton = new Button(this);
+        importHudButton.setText(R.string.hud_import_layout);
+        importHudButton.setOnClickListener(v -> importHudLayout());
+        root.addView(importHudButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
     }
 
     /**
@@ -359,6 +962,23 @@ public class SettingsActivity extends Activity {
         immersiveHint.setTextColor(Color.GRAY);
         immersiveHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(immersiveHint);
+
+        Switch refreshRateSwitch = new Switch(this);
+        refreshRateSwitch.setText(R.string.immersive_oplus_refresh_rate_switch);
+        refreshRateSwitch.setTextSize(14);
+        refreshRateSwitch.setChecked(prefs.getBoolean(KEY_OPLUS_REFRESH_RATE_LOCK,
+                OplusRefreshRateLease.DEFAULT_ENABLED));
+        refreshRateSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_OPLUS_REFRESH_RATE_LOCK, checked).apply());
+        root.addView(refreshRateSwitch);
+
+        TextView refreshRateHint = new TextView(this);
+        refreshRateHint.setText(R.string.immersive_oplus_refresh_rate_hint);
+        refreshRateHint.setTextSize(12);
+        refreshRateHint.setTextColor(Color.GRAY);
+        refreshRateHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(refreshRateHint);
 
         // Constructing the row appends it to `root`.
         new KeyBinding(root, KEY_IMMERSIVE_KEYCODE, KEY_IMMERSIVE_SCANCODE,
@@ -514,139 +1134,6 @@ public class SettingsActivity extends Activity {
         root.addView(accessibilityHint);
     }
 
-    private void buildExtraKeysSection(LinearLayout root) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-
-        TextView header = new TextView(this);
-        header.setText(R.string.section_extra_keys);
-        header.setTextSize(16);
-        header.setTypeface(null, Typeface.BOLD);
-        header.setPadding(0, dp(24), 0, dp(8));
-        root.addView(header);
-
-        // === Extra keys bar mode selector ===
-        TextView modeLabel = new TextView(this);
-        modeLabel.setText(R.string.extra_keys_mode_label);
-        modeLabel.setTextSize(14);
-        modeLabel.setPadding(0, dp(8), 0, dp(4));
-        root.addView(modeLabel);
-
-        Spinner modeSpinner = new Spinner(this);
-        modeSpinner.setAdapter(new ArrayAdapter<>(this,
-            android.R.layout.simple_spinner_dropdown_item,
-            getResources().getStringArray(R.array.extra_keys_mode_options)));
-
-        String curMode = getExtraKeysMode(prefs);
-        int modeIdx = 0; // default: always
-        for (int i = 0; i < EXTRA_KEYS_MODES.length; i++) {
-            if (EXTRA_KEYS_MODES[i].equals(curMode)) { modeIdx = i; break; }
-        }
-        modeSpinner.setSelection(modeIdx);
-        modeSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View v, int pos, long id) {
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                    .putString(KEY_EXTRA_KEYS_MODE, EXTRA_KEYS_MODES[pos]).apply();
-            }
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
-        root.addView(modeSpinner);
-
-        TextView modeHint = new TextView(this);
-        modeHint.setText(R.string.extra_keys_mode_hint);
-        modeHint.setTextSize(12);
-        modeHint.setTextColor(Color.GRAY);
-        modeHint.setPadding(0, dp(4), 0, dp(8));
-        root.addView(modeHint);
-
-        // === Back key opens extra keys bar ===
-        Switch backOpensExtraKeysSwitch = new Switch(this);
-        backOpensExtraKeysSwitch.setText(R.string.back_opens_switch);
-        backOpensExtraKeysSwitch.setTextSize(14);
-        backOpensExtraKeysSwitch.setPadding(0, dp(16), 0, 0);
-        backOpensExtraKeysSwitch.setChecked(prefs.getBoolean(KEY_BACK_OPENS_EXTRA_KEYS, true));
-        backOpensExtraKeysSwitch.setOnCheckedChangeListener((v, checked) ->
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(KEY_BACK_OPENS_EXTRA_KEYS, checked).apply());
-        root.addView(backOpensExtraKeysSwitch);
-
-        TextView backOpensExtraKeysHint = new TextView(this);
-        backOpensExtraKeysHint.setText(R.string.back_opens_hint);
-        backOpensExtraKeysHint.setTextSize(12);
-        backOpensExtraKeysHint.setTextColor(Color.GRAY);
-        backOpensExtraKeysHint.setPadding(0, dp(4), 0, dp(8));
-        root.addView(backOpensExtraKeysHint);
-
-    }
-
-    private void buildCustomLayoutSection(LinearLayout root) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-
-        TextView layoutHeader = new TextView(this);
-        layoutHeader.setText(R.string.section_custom_layout);
-        layoutHeader.setTextSize(16);
-        layoutHeader.setTypeface(null, Typeface.BOLD);
-        layoutHeader.setPadding(0, dp(24), 0, dp(8));
-        root.addView(layoutHeader);
-
-        layoutInput = new EditText(this);
-        layoutInput.setTypeface(Typeface.MONOSPACE);
-        layoutInput.setTextSize(12);
-        layoutInput.setGravity(Gravity.TOP | Gravity.START);
-        layoutInput.setInputType(InputType.TYPE_CLASS_TEXT
-            | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        layoutInput.setHorizontallyScrolling(false);
-        layoutInput.setMinLines(6);
-        String savedLayout = prefs.getString(KEY_EXTRA_KEYS_LAYOUT, "");
-        if (savedLayout.isEmpty()) savedLayout = ExtraKeysBar.defaultLayoutJson();
-        layoutInput.setText(savedLayout);
-        root.addView(layoutInput);
-
-        final TextView layoutStatus = new TextView(this);
-        layoutStatus.setTextSize(12);
-        layoutStatus.setPadding(0, dp(4), 0, dp(4));
-        root.addView(layoutStatus);
-        updateLayoutStatus(layoutStatus, layoutInput.getText().toString());
-
-        layoutInput.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
-            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
-            @Override public void afterTextChanged(Editable s) {
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                    .putString(KEY_EXTRA_KEYS_LAYOUT, s.toString()).apply();
-                updateLayoutStatus(layoutStatus, s.toString());
-            }
-        });
-
-        LinearLayout layoutButtons = new LinearLayout(this);
-        layoutButtons.setOrientation(LinearLayout.HORIZONTAL);
-
-        Button loadDefaultBtn = new Button(this);
-        loadDefaultBtn.setText(R.string.btn_load_default);
-        loadDefaultBtn.setOnClickListener(v ->
-            layoutInput.setText(ExtraKeysBar.defaultLayoutJson()));
-        layoutButtons.addView(loadDefaultBtn);
-
-        Button loadFileBtn = new Button(this);
-        loadFileBtn.setText(R.string.btn_load_file);
-        loadFileBtn.setOnClickListener(v -> pickLayoutFile());
-        layoutButtons.addView(loadFileBtn);
-
-        root.addView(layoutButtons);
-
-        TextView layoutHint = new TextView(this);
-        layoutHint.setText(R.string.layout_hint);
-        layoutHint.setTextSize(12);
-        layoutHint.setTextColor(Color.GRAY);
-        layoutHint.setPadding(0, dp(4), 0, dp(8));
-        root.addView(layoutHint);
-    }
-
-    // ============================================================
-    // General page sections
-    // ============================================================
     private void buildOrientationSection(LinearLayout root) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
@@ -737,6 +1224,51 @@ public class SettingsActivity extends Activity {
         touchpadHint.setTextColor(Color.GRAY);
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
+
+        Switch tapSwitch = new Switch(this);
+        tapSwitch.setText(R.string.pad_tap);
+        tapSwitch.setTextSize(14);
+        tapSwitch.setPadding(0, dp(8), 0, 0);
+        tapSwitch.setChecked(prefs.getBoolean(KEY_PAD_TAP, true));
+        tapSwitch.setOnCheckedChangeListener((v, checked) ->
+                prefs.edit().putBoolean(KEY_PAD_TAP, checked).apply());
+        root.addView(tapSwitch);
+
+        TextView padHint = new TextView(this);
+        padHint.setText(R.string.pad_tip);
+        padHint.setTextSize(12);
+        padHint.setTextColor(Color.GRAY);
+        padHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(padHint);
+
+        TextView guardValue = new TextView(this);
+        int guard = Math.max(0, Math.min(1000,
+                prefs.getInt(KEY_PAD_SCROLL_GUARD_MS, 0)));
+        guardValue.setText(getString(R.string.pad_guard, guard));
+        guardValue.setTextSize(14);
+        guardValue.setTextColor(Color.BLUE);
+        root.addView(guardValue);
+        SeekBar guardSeek = new SeekBar(this);
+        guardSeek.setMax(20);
+        guardSeek.setProgress(Math.round(guard / 50f));
+        guardSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                guardValue.setText(getString(R.string.pad_guard, progress * 50));
+                if (fromUser) prefs.edit().putInt(KEY_PAD_SCROLL_GUARD_MS, progress * 50).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        root.addView(guardSeek);
+
+        Switch padDebug = new Switch(this);
+        padDebug.setText(R.string.pad_debug);
+        padDebug.setTextSize(14);
+        padDebug.setPadding(0, dp(8), 0, 0);
+        padDebug.setChecked(prefs.getBoolean(KEY_PAD_DEBUG, false));
+        padDebug.setOnCheckedChangeListener((v, checked) ->
+                prefs.edit().putBoolean(KEY_PAD_DEBUG, checked).apply());
+        root.addView(padDebug);
 
         // External mouse pointer capture.  This is opt-in because it changes
         // Android's mouse event mode from absolute coordinates to relative motion.
@@ -893,6 +1425,117 @@ public class SettingsActivity extends Activity {
             hint.setPadding(0, dp(2), 0, dp(12));
             root.addView(hint);
         }
+    }
+
+    private void addHdrSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(16), 0, 0);
+        Switch hdrSwitch = new Switch(this);
+        hdrSwitch.setText(R.string.hdr_switch);
+        hdrSwitch.setTextSize(14);
+        hdrSwitch.setMinWidth(0);
+        hdrSwitch.setPadding(0, 0, dp(8), 0);
+        hdrSwitch.setChecked(prefs.getBoolean(MainActivity.KEY_EXPERIMENTAL_HDR, false));
+        row.addView(hdrSwitch, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        Button brightness = new Button(this);
+        brightness.setTextSize(12);
+        brightness.setAllCaps(false);
+        brightness.setMinWidth(0);
+        brightness.setMinimumWidth(0);
+        brightness.setMaxWidth(dp(148));
+        brightness.setPadding(dp(8), 0, dp(8), 0);
+        updateHdrBrightnessButton(brightness, prefs);
+        brightness.setEnabled(hdrSwitch.isChecked());
+        brightness.setOnClickListener(view -> showHdrBrightnessDialog(brightness, prefs));
+        row.addView(brightness, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        hdrSwitch.setOnCheckedChangeListener((view, checked) -> {
+            prefs.edit().putBoolean(MainActivity.KEY_EXPERIMENTAL_HDR, checked).apply();
+            brightness.setEnabled(checked);
+        });
+        root.addView(row);
+
+        TextView hint = new TextView(this);
+        hint.setText(R.string.hdr_hint);
+        hint.setTextSize(12);
+        hint.setTextColor(Color.GRAY);
+        hint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(hint);
+    }
+
+    private void updateHdrBrightnessButton(Button button, SharedPreferences prefs) {
+        int nits = HdrBrightness.clamp(prefs.getInt(
+                HdrBrightness.KEY_SDR_WHITE_NITS, HdrBrightness.DEFAULT_NITS));
+        button.setText(getString(R.string.hdr_brightness_button, nits));
+        button.setContentDescription(getString(R.string.hdr_brightness_accessibility, nits));
+    }
+
+    private void showHdrBrightnessDialog(Button button, SharedPreferences prefs) {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(24), dp(12), dp(24), 0);
+        TextView explanation = new TextView(this);
+        explanation.setText(R.string.hdr_brightness_hint);
+        explanation.setTextSize(14);
+        content.addView(explanation);
+
+        TextView value = new TextView(this);
+        value.setTextSize(20);
+        value.setPadding(0, dp(16), 0, dp(8));
+        content.addView(value);
+        SeekBar seek = new SeekBar(this);
+        seek.setContentDescription(getString(R.string.hdr_brightness_title));
+        seek.setMin(HdrBrightness.MIN_NITS);
+        seek.setMax(HdrBrightness.MAX_NITS);
+        int current = HdrBrightness.clamp(prefs.getInt(
+                HdrBrightness.KEY_SDR_WHITE_NITS, HdrBrightness.DEFAULT_NITS));
+        seek.setProgress(current);
+        seek.setStateDescription(getString(R.string.hdr_brightness_value, current));
+        value.setText(getString(R.string.hdr_brightness_value, current));
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                int nits = progress;
+                value.setText(getString(R.string.hdr_brightness_value, nits));
+                seek.setStateDescription(getString(R.string.hdr_brightness_value, nits));
+                prefs.edit().putInt(HdrBrightness.KEY_SDR_WHITE_NITS, nits).apply();
+                updateHdrBrightnessButton(button, prefs);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
+        });
+        content.addView(seek, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout presets = new LinearLayout(this);
+        for (int nits : new int[] {HdrBrightness.DEFAULT_NITS, 300, 400}) {
+            Button preset = new Button(this);
+            preset.setText(getString(R.string.hdr_brightness_value, nits));
+            preset.setTextSize(12);
+            preset.setAllCaps(false);
+            preset.setMinWidth(0);
+            preset.setMinimumWidth(0);
+            preset.setPadding(dp(4), 0, dp(4), 0);
+            preset.setOnClickListener(view -> seek.setProgress(nits));
+            presets.addView(preset, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        }
+        content.addView(presets);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(content);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(R.string.hdr_brightness_title)
+                .setView(scroll)
+                .setNeutralButton(R.string.hdr_brightness_reset, null)
+                .setPositiveButton(android.R.string.ok, null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+                .setOnClickListener(view -> seek.setProgress(
+                        HdrBrightness.DEFAULT_NITS)));
+        dialog.show();
     }
 
     // Connection settings: a custom daemon socket path and a "connect with root"
@@ -1319,35 +1962,114 @@ public class SettingsActivity extends Activity {
         return true;
     }
 
-    // Launch the system document picker to load a layout JSON from any provider
-    // (Downloads, Drive, etc.). Uses SAF, so no storage permission is required.
-    private void pickLayoutFile() {
+    // ---- HUD layout export / import (SAF, no storage permission needed) ----
+
+    private void chooseHudSlot(int title, java.util.function.IntConsumer onSelected) {
+        String[] labels = {getString(R.string.hud_slot_1), getString(R.string.hud_slot_2),
+                getString(R.string.hud_slot_3)};
+        new AlertDialog.Builder(this).setTitle(title).setItems(labels,
+                (dialog, which) -> onSelected.accept(which)).setNegativeButton(android.R.string.cancel, null).show();
+    }
+
+    private void exportHudLayout() {
+        chooseHudSlot(R.string.hud_export_choose, slot -> {
+            try {
+                String json = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getString(KEY_HUD_LAYOUT_PROFILE, null);
+                pendingHudExport = com.anland.consumer.hud.HudLayoutProfile.fromJSON(json)
+                        .exportSlot(slot).toString();
+                Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("application/json");
+                intent.putExtra(Intent.EXTRA_TITLE, "anland-hud-layout-" + (slot + 1) + ".json");
+                startActivityForResult(intent, REQ_EXPORT_HUD_LAYOUT);
+            } catch (android.content.ActivityNotFoundException e) {
+                Toast.makeText(this, R.string.toast_no_picker, Toast.LENGTH_SHORT).show();
+            } catch (Exception e) {
+                Log.w(TAG, "HUD export preparation failed", e);
+                Toast.makeText(this, R.string.hud_export_failed, Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    /** Ask the user for a JSON file and replace the HUD profile with it. */
+    private void importHudLayout() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
         intent.putExtra(Intent.EXTRA_MIME_TYPES,
-            new String[]{"application/json", "text/plain"});
+                new String[]{"application/json", "text/plain"});
         try {
-            startActivityForResult(intent, REQ_PICK_LAYOUT);
+            startActivityForResult(intent, REQ_IMPORT_HUD_LAYOUT);
         } catch (android.content.ActivityNotFoundException e) {
             Toast.makeText(this, R.string.toast_no_picker, Toast.LENGTH_SHORT).show();
         }
     }
 
+    private void writeTextToUri(Uri uri, String text) {
+        try (java.io.OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+            if (out == null) throw new java.io.IOException("no output stream");
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            Toast.makeText(this, R.string.hud_export_done, Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Log.w(TAG, "writeTextToUri failed", e);
+            Toast.makeText(this, R.string.hud_export_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void applyImportedHudLayout(JSONObject document, int source, int destination) {
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            com.anland.consumer.hud.HudLayoutProfile profile =
+                    com.anland.consumer.hud.HudLayoutProfile.fromJSON(
+                            prefs.getString(KEY_HUD_LAYOUT_PROFILE, null));
+            profile.importSlot(document, source, destination);
+            prefs.edit().putString(KEY_HUD_LAYOUT_PROFILE, profile.toJSON().toString())
+                    .putBoolean(KEY_USE_HUD_OVERLAY, true).apply();
+            Toast.makeText(this, R.string.hud_import_done, Toast.LENGTH_SHORT).show();
+        } catch (Exception e) {
+            Log.w(TAG, "Invalid HUD layout import", e);
+            Toast.makeText(this, R.string.hud_import_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void chooseHudImportDestination(JSONObject document, int source) {
+        chooseHudSlot(R.string.hud_import_choose, destination ->
+                applyImportedHudLayout(document, source, destination));
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQ_PICK_LAYOUT || resultCode != RESULT_OK || data == null)
-            return;
+        if (resultCode != RESULT_OK || data == null) return;
         Uri uri = data.getData();
         if (uri == null) return;
-        String text = readTextFromUri(uri);
-        if (text == null) {
-            Toast.makeText(this, R.string.toast_read_failed, Toast.LENGTH_SHORT).show();
-            return;
+        if (requestCode == REQ_EXPORT_HUD_LAYOUT) {
+            if (pendingHudExport == null) {
+                Toast.makeText(this, R.string.hud_export_failed, Toast.LENGTH_SHORT).show();
+            } else {
+                writeTextToUri(uri, pendingHudExport);
+                pendingHudExport = null;
+            }
+        } else if (requestCode == REQ_IMPORT_HUD_LAYOUT) {
+            String text = readTextFromUri(uri);
+            if (text == null) {
+                Toast.makeText(this, R.string.toast_read_failed, Toast.LENGTH_SHORT).show();
+                return;
+            }
+            try {
+                JSONObject document = new JSONObject(text);
+                if (!document.has("format") && (document.has("layout_2") || document.has("layout_3"))) {
+                    chooseHudSlot(R.string.hud_import_source_choose, source ->
+                            chooseHudImportDestination(document, source));
+                } else {
+                    chooseHudImportDestination(document, 0);
+                }
+            } catch (Exception e) {
+                Toast.makeText(this, R.string.hud_import_failed, Toast.LENGTH_SHORT).show();
+            }
         }
-        // setText flows through the editor's TextWatcher, which persists + validates.
-        if (layoutInput != null) layoutInput.setText(text);
     }
 
     private String readTextFromUri(Uri uri) {
@@ -1364,37 +2086,7 @@ public class SettingsActivity extends Activity {
         }
     }
 
-    // Reflect the validity of the custom layout JSON inline under the editor.
-    private void updateLayoutStatus(TextView status, String json) {
-        if (json == null || json.trim().isEmpty()) {
-            status.setText(R.string.layout_status_default);
-            status.setTextColor(Color.GRAY);
-            return;
-        }
-        String err = ExtraKeysBar.validateLayout(json);
-        if (err == null) {
-            status.setText(R.string.layout_status_valid);
-            status.setTextColor(0xFF2E7D32);  // green
-        } else {
-            status.setText(getString(R.string.layout_status_invalid, err));
-            status.setTextColor(0xFFC62828);  // red
-        }
-    }
-
     private int dp(int dp) {
         return (int) (dp * getResources().getDisplayMetrics().density);
-    }
-
-    // Read the extra-keys mode, migrating from the old two-switch prefs if needed.
-    private String getExtraKeysMode(SharedPreferences prefs) {
-        String mode = prefs.getString(KEY_EXTRA_KEYS_MODE, null);
-        if (mode != null) return mode;
-        // Migrate from legacy boolean keys
-        boolean autoShow = prefs.getBoolean("auto_show_extra_keys", true);
-        boolean enabled = prefs.getBoolean("extra_keys_bar", false);
-        mode = autoShow ? MODE_WITH_KEYBOARD : (enabled ? MODE_ALWAYS : MODE_NEVER);
-        prefs.edit().putString(KEY_EXTRA_KEYS_MODE, mode)
-              .remove("auto_show_extra_keys").remove("extra_keys_bar").apply();
-        return mode;
     }
 }

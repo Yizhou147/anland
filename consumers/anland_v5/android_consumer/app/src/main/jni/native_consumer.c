@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <android/log.h>
+#include <android/data_space.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <ctype.h>
@@ -9,15 +10,18 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "anw_hidden.h"
+#include "anland_hdr.h"
 #include "camera_service.h"
 #include "display_consumer.h"
 #include "native_audio.h"
@@ -29,8 +33,26 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
+#define CONNECT_DISPLAY_REJECTED -2
+#define PACING_REPORT_INTERVAL_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
+
+struct pacing_sample {
+    uint64_t total_ns;
+    uint64_t worst_ns;
+    uint64_t count;
+};
+
+struct consumer_pacing {
+    uint64_t interval_start_ns;
+    uint64_t producer_waits;
+    uint64_t surface_queued;
+    uint64_t queue_failures;
+    struct pacing_sample producer_wait;
+    struct pacing_sample completion_to_queue;
+    struct pacing_sample acquire_fence_wait;
+    struct pacing_sample buffer_reuse;
+};
 
 /* Saved JVM reference for event-thread JNI callbacks. Process-global (the JVM is);
  * the per-thread env is attached as needed. The activity callback target is
@@ -46,6 +68,10 @@ static void on_fallback(void *userdata);
 static void on_exit_fallback(void *userdata);
 struct consumer_state {
     pthread_mutex_t lock;
+    /* Serialises the producer input stream; tablet frames hold it across their
+     * four records so the FRAME remains an atomic sample commit. */
+    pthread_mutex_t input_lock;
+    bool input_hdr_enabled; /* connected stream mode, guarded by input_lock */
     ANativeWindow *window;
     display_ctx *ctx;
     pthread_t render_thread;
@@ -59,9 +85,13 @@ struct consumer_state {
     int dmabuf_fds[MAX_COLLECT_BUFS];
     struct buf_info dmabuf_infos[MAX_COLLECT_BUFS];
     ANativeWindowBuffer *buf_anb[MAX_COLLECT_BUFS];
+    uint64_t buffer_queued_at_ns[MAX_COLLECT_BUFS];
+    struct consumer_pacing pacing;
 
     int screen_w;
     int screen_h;
+    uint32_t pixel_format;
+    bool active_hdr_enabled; /* render-thread-owned snapshot, never a live toggle */
 
     // Latest display refresh rate (milli-Hz) reported from Java. Read on
     // (re)connect to seed the producer; updated live by nativeSetRefreshRate.
@@ -81,10 +111,16 @@ struct consumer_state {
     pthread_mutex_t cfg_lock;
     char cfg_socket_path[256];
     bool cfg_use_root;
+    bool cfg_hdr_enabled;
+    bool cfg_hdr10_supported;
+    int cfg_hdr_sdr_white_nits;
     char cfg_helper_path[512];
     char cfg_bridge_path[512];
     int  cfg_custom_width;
     int  cfg_custom_height;
+    /* SurfaceHolder dimensions avoid stale ANativeWindow geometry after rotation. */
+    int  cfg_screen_width;
+    int  cfg_screen_height;
     bool cfg_topapp_enable;
     char cfg_topapp_path[512];
     int cfg_topapp_mode;
@@ -130,6 +166,145 @@ struct consumer_state {
 static void topapp_handle_scheduling_event(struct consumer_state *s,
                                            const struct OutputEvent *event);
 
+static void call_display_error(JNIEnv *env, jobject activity, int error)
+{
+    if (!activity)
+        return;
+    jclass cls = (*env)->GetObjectClass(env, activity);
+    jmethodID mid = (*env)->GetMethodID(env, cls, "onDisplayError", "(I)V");
+    if (mid)
+        (*env)->CallVoidMethod(env, activity, mid, (jint)error);
+    (*env)->DeleteLocalRef(env, cls);
+}
+
+static int reject_hdr_display(struct consumer_state *s, int error)
+{
+    LOGE("HDR connection rejected (error=%d); refusing SDR fallback", error);
+    JNIEnv *env = NULL;
+    if (g_jvm && (*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == 0) {
+        call_display_error(env, s->activity_obj, error);
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+    return CONNECT_DISPLAY_REJECTED;
+}
+
+static int send_input_event(struct consumer_state *s, const struct InputEvent *event)
+{
+    pthread_mutex_lock(&s->input_lock);
+    int rc = s->ctx ? push_input_event(s->ctx, event) : 0;
+    pthread_mutex_unlock(&s->input_lock);
+    return rc;
+}
+
+static int send_input_payload(struct consumer_state *s, const struct InputEvent *event,
+                              void *payload, size_t size)
+{
+    pthread_mutex_lock(&s->input_lock);
+    int rc = s->ctx ? push_input_event_with_length(s->ctx, event, payload, size) : 0;
+    pthread_mutex_unlock(&s->input_lock);
+    return rc;
+}
+
+/* Caller holds input_lock. Read the latest preference only after acquiring that
+ * lock: reconnect and live updates cannot send an older saved value last. No
+ * path holds cfg_lock while acquiring input_lock. */
+static void send_hdr_sdr_white_locked(struct consumer_state *s)
+{
+    if (!s->ctx || !s->input_hdr_enabled)
+        return;
+    pthread_mutex_lock(&s->cfg_lock);
+    int nits = s->cfg_hdr_sdr_white_nits;
+    pthread_mutex_unlock(&s->cfg_lock);
+    struct InputEvent event = {
+        .type = INPUT_TYPE_ACTION,
+        .input_action = {
+            .action = ANLAND_HDR_ACTION_SDR_WHITE,
+            .value = nits,
+        },
+    };
+    if (push_input_event(s->ctx, &event) < 0)
+        LOGE("could not send HDR SDR reference white: %d nit", nits);
+}
+
+static uint64_t monotonic_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void pacing_add(struct pacing_sample *sample, uint64_t duration_ns)
+{
+    sample->total_ns += duration_ns;
+    if (duration_ns > sample->worst_ns)
+        sample->worst_ns = duration_ns;
+    sample->count++;
+}
+
+static uint64_t pacing_mean_us(const struct pacing_sample *sample)
+{
+    return sample->count ? sample->total_ns / sample->count / 1000ULL : 0;
+}
+
+static void pacing_reset(struct consumer_state *s)
+{
+    memset(&s->pacing, 0, sizeof(s->pacing));
+    memset(s->buffer_queued_at_ns, 0, sizeof(s->buffer_queued_at_ns));
+}
+
+static void pacing_report_if_due(struct consumer_state *s, uint64_t now_ns)
+{
+    if (!s->pacing.interval_start_ns || now_ns < s->pacing.interval_start_ns ||
+        now_ns - s->pacing.interval_start_ns < PACING_REPORT_INTERVAL_NS)
+        return;
+
+    const uint64_t elapsed_ns = now_ns - s->pacing.interval_start_ns;
+    const uint64_t queue_fps = elapsed_ns
+        ? s->pacing.surface_queued * 1000000000ULL / elapsed_ns : 0;
+    LOGI("pacing queue_fps=%llu queued=%llu queue_fail=%llu producer_wait=%llu "
+         "producer_wait_us(avg/max)=%llu/%llu(n=%llu) "
+         "completion_to_queue_us(avg/max)=%llu/%llu(n=%llu) "
+         "acquire_fence_us(avg/max)=%llu/%llu(n=%llu) "
+         "buffer_reuse_us(avg/max)=%llu/%llu(n=%llu)",
+         (unsigned long long)queue_fps,
+         (unsigned long long)s->pacing.surface_queued,
+         (unsigned long long)s->pacing.queue_failures,
+         (unsigned long long)s->pacing.producer_waits,
+         (unsigned long long)pacing_mean_us(&s->pacing.producer_wait),
+         (unsigned long long)(s->pacing.producer_wait.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.producer_wait.count,
+         (unsigned long long)pacing_mean_us(&s->pacing.completion_to_queue),
+         (unsigned long long)(s->pacing.completion_to_queue.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.completion_to_queue.count,
+         (unsigned long long)pacing_mean_us(&s->pacing.acquire_fence_wait),
+         (unsigned long long)(s->pacing.acquire_fence_wait.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.acquire_fence_wait.count,
+         (unsigned long long)pacing_mean_us(&s->pacing.buffer_reuse),
+         (unsigned long long)(s->pacing.buffer_reuse.worst_ns / 1000ULL),
+         (unsigned long long)s->pacing.buffer_reuse.count);
+    memset(&s->pacing, 0, sizeof(s->pacing));
+    s->pacing.interval_start_ns = now_ns;
+}
+
+static int queue_surface_buffer(struct consumer_state *s,
+                                ANativeWindowBuffer *buffer, int fence_fd,
+                                int buffer_index, uint64_t completion_ns)
+{
+    const int rc = api.queueBuffer(s->window, buffer, fence_fd);
+    const uint64_t queued_ns = monotonic_now_ns();
+    if (buffer_index >= 0 && buffer_index < s->buf_count)
+        s->buffer_queued_at_ns[buffer_index] = rc == 0 ? queued_ns : 0;
+    if (rc == 0)
+        s->pacing.surface_queued++;
+    else
+        s->pacing.queue_failures++;
+    if (completion_ns && queued_ns >= completion_ns)
+        pacing_add(&s->pacing.completion_to_queue, queued_ns - completion_ns);
+    pacing_report_if_due(s, queued_ns);
+    return rc;
+}
+
 static int collect_dmabufs(struct consumer_state *s)
 {
     ANativeWindow *win = s->window;
@@ -158,6 +333,12 @@ static int collect_dmabufs(struct consumer_state *s)
 
         int fd = anb->handle->data[0];   /* first fd backs the dma-buf */
         int stride = anb->stride, width = anb->width, height = anb->height;
+        if ((uint32_t)anb->format != s->pixel_format || stride <= 0) {
+            LOGE("buffer format/stride mismatch: requested=%u actual=%d stride=%d",
+                 s->pixel_format, anb->format, stride);
+            api.cancelBuffer(win, anb, -1);
+            break;
+        }
 
         /* deduplicate by ANativeWindowBuffer pointer (stable per queue slot) */
         bool dup_found = false;
@@ -169,7 +350,10 @@ static int collect_dmabufs(struct consumer_state *s)
         }
 
         /* post it back so the next dequeue rotates to another slot */
-        api.queueBuffer(win, anb, -1);
+        if (api.queueBuffer(win, anb, -1) != 0) {
+            LOGE("failed to queue buffer during collection");
+            break;
+        }
 
         if (dup_found)
             continue;
@@ -183,11 +367,11 @@ static int collect_dmabufs(struct consumer_state *s)
         s->dmabuf_infos[found].stride = stride * 4;
         s->dmabuf_infos[found].width  = width;
         s->dmabuf_infos[found].height = height;
-        s->dmabuf_infos[found].format = PIXEL_FORMAT_RGBA_8888;
+        s->dmabuf_infos[found].format = (uint32_t)anb->format;
         s->dmabuf_infos[found].modifier = 0;
         s->dmabuf_infos[found].offset = 0;
-        LOGI("  buf[%d]: anb=%p fd=%d dup=%d %dx%d stride=%d",
-             found, (void *)anb, fd, dup_fd, width, height, stride);
+        LOGI("  buf[%d]: anb=%p fd=%d dup=%d %dx%d stride=%d format=%d",
+             found, (void *)anb, fd, dup_fd, width, height, stride, anb->format);
         found++;
     }
 
@@ -197,6 +381,7 @@ static int collect_dmabufs(struct consumer_state *s)
             close(s->dmabuf_fds[i]);
             s->dmabuf_fds[i] = -1;
         }
+        s->buf_count = 0;
         return -1;
     }
 
@@ -227,7 +412,7 @@ static void send_refresh_rate(struct consumer_state *s)
         .type = INPUT_TYPE_DISPLAY_REFRESH,
         .display = { .refresh_mhz = s->refresh_mhz },
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
 }
 
 /*
@@ -351,6 +536,45 @@ static void stop_event_thread(struct consumer_state *s)
 }
 
 /*
+ * Appends `in` to `out` as one shell word, separated from whatever is already
+ * there: single-quoted, with embedded quotes escaped as '\''. This is what makes
+ * the result safe to hand to `su -c` -- without it, a socket path containing a
+ * shell metacharacter is a command run as root, and the socket path comes from
+ * the saved preference or from the launch Intent, neither of which is ours.
+ *
+ * Returns false when the result would not fit. The caller must then refuse
+ * rather than run it: a truncated command line is a different command.
+ */
+static bool append_quoted(char *out, size_t out_size, size_t *used, const char *in)
+{
+    if (*used > 0) {
+        if (*used + 1 >= out_size)
+            return false;
+        out[(*used)++] = ' ';
+    }
+    if (*used + 1 >= out_size)
+        return false;
+    out[(*used)++] = '\'';
+    for (const char *p = in; *p != '\0'; p++) {
+        if (*p == '\'') {
+            if (*used + 4 >= out_size)
+                return false;
+            memcpy(out + *used, "'\\''", 4);
+            *used += 4;
+        } else {
+            if (*used + 1 >= out_size)
+                return false;
+            out[(*used)++] = *p;
+        }
+    }
+    if (*used + 2 >= out_size)
+        return false;
+    out[(*used)++] = '\'';
+    out[*used] = '\0';
+    return true;
+}
+
+/*
  * "Connect with root" handshake. The app cannot connect() to a root-owned
  * daemon socket directly, so it listens on a bridge socket, launches the bundled
  * helper through `su -c`, and the helper (as root) connects to the daemon and
@@ -395,10 +619,19 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
         return -1;
     }
 
-    /* Build the command su runs: "<helper> <daemon_sock> <bridge_path>". */
-    char inner[1100];
-    snprintf(inner, sizeof(inner), "%s %s %s",
-             helper_path, daemon_sock, bridge_path);
+    /* Build the command su runs: "<helper> <daemon_sock> <bridge_path>", each
+     * argument quoted so none of them can be read as shell syntax. */
+    char inner[2048];
+    size_t used = 0;
+    inner[0] = '\0';
+    if (!append_quoted(inner, sizeof(inner), &used, helper_path)
+            || !append_quoted(inner, sizeof(inner), &used, daemon_sock)
+            || !append_quoted(inner, sizeof(inner), &used, bridge_path)) {
+        LOGE("root helper: command line too long to quote safely");
+        close(lfd);
+        unlink(bridge_path);
+        return -1;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -673,9 +906,13 @@ static void topapp_handle_scheduling_event(struct consumer_state *s,
 
 static int do_connect(struct consumer_state *s)
 {
+    pacing_reset(s);
     /* Snapshot the connection config for this attempt. */
     pthread_mutex_lock(&s->cfg_lock);
     bool use_root = s->cfg_use_root;
+    bool hdr_enabled = s->cfg_hdr_enabled;
+    bool hdr10_supported = s->cfg_hdr10_supported;
+    s->active_hdr_enabled = hdr_enabled;
     char sock_path[sizeof(s->cfg_socket_path)];
     char helper_path[sizeof(s->cfg_helper_path)];
     char bridge_path[sizeof(s->cfg_bridge_path)];
@@ -700,20 +937,30 @@ static int do_connect(struct consumer_state *s)
         audio_set_ctx(s->audio, NULL);   /* detach audio before the old ctx (and its fd) dies */
         stop_event_thread(s);
         join_event_thread(s);
+        pthread_mutex_lock(&s->input_lock);
         disconnect(s->ctx);
         s->ctx = NULL;
+        pthread_mutex_unlock(&s->input_lock);
     }
     cleanup_dmabufs(s);
+
+    if (hdr_enabled && !hdr10_supported)
+        return reject_hdr_display(s, 1);
 
     ANativeWindow *win = s->window;
     pthread_mutex_lock(&s->cfg_lock);
     int cw = s->cfg_custom_width;
     int ch = s->cfg_custom_height;
+    int sw = s->cfg_screen_width;
+    int sh = s->cfg_screen_height;
     pthread_mutex_unlock(&s->cfg_lock);
 
     if (cw > 0 && ch > 0) {
         s->screen_w = cw;
         s->screen_h = ch;
+    } else if (sw > 0 && sh > 0) {
+        s->screen_w = sw;
+        s->screen_h = sh;
     } else {
        s->screen_w = ANativeWindow_getWidth(win);
        s->screen_h = ANativeWindow_getHeight(win);
@@ -724,11 +971,22 @@ static int do_connect(struct consumer_state *s)
     anw_api_disconnect(win, ANW_API_CPU);
     if (anw_api_connect(win, ANW_API_CPU) != 0) {
         LOGE("api_connect(CPU) failed");
-        return -1;
+        return hdr_enabled ? reject_hdr_display(s, 2) : -1;
     }
 
-    ANativeWindow_setBuffersGeometry(win, s->screen_w, s->screen_h,
-                                     AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
+    s->pixel_format = hdr_enabled ? AHARDWAREBUFFER_FORMAT_R10G10B10A2_UNORM
+                                  : AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+    int geometry_rc = ANativeWindow_setBuffersGeometry(win, s->screen_w, s->screen_h,
+                                                       s->pixel_format);
+    // Dataspace describes already encoded pixels. KDE follows this consumer
+    // buffer format unless HDR is explicitly disabled in its environment.
+    int dataspace_rc = ANativeWindow_setBuffersDataSpace(win,
+            hdr_enabled ? ADATASPACE_BT2020_PQ : ADATASPACE_SRGB);
+    if (geometry_rc != 0 || dataspace_rc != 0) {
+        LOGE("surface configuration failed: HDR=%d geometry=%d dataspace=%d",
+             hdr_enabled, geometry_rc, dataspace_rc);
+        return hdr_enabled ? reject_hdr_display(s, 2) : -1;
+    }
 
     int min_undequeued = 0;
     api.query(win, ANATIVEWINDOW_QUERY_MIN_UNDEQUEUED_BUFFERS, &min_undequeued);
@@ -736,33 +994,44 @@ static int do_connect(struct consumer_state *s)
     if (total > MAX_COLLECT_BUFS)
         total = MAX_COLLECT_BUFS;
 
-    api.setBufferCount(win, total);
+    if (api.setBufferCount(win, total) != 0) {
+        LOGE("setBufferCount failed");
+        return hdr_enabled ? reject_hdr_display(s, 2) : -1;
+    }
 
     s->buf_count = total;
     if (collect_dmabufs(s) < 0)
-        return -1;
+        return hdr_enabled ? reject_hdr_display(s, 2) : -1;
 
-    LOGI("connecting to %s (%dx%d, %d bufs, root=%d)", sock,
-         s->screen_w, s->screen_h, s->buf_count, use_root);
+    LOGI("connecting to %s (%dx%d, %d bufs, root=%d format=%u HDR=%d)", sock,
+         s->screen_w, s->screen_h, s->buf_count, use_root,
+         s->pixel_format, hdr_enabled);
 
+    pthread_mutex_lock(&s->input_lock);
+    s->input_hdr_enabled = false;
     if (use_root) {
         int ctrl_fd = recv_fd_via_root_helper(sock, helper_path, bridge_path);
         if (ctrl_fd < 0) {
             LOGE("root helper connect failed");
+            pthread_mutex_unlock(&s->input_lock);
             return -1;
         }
         if (connect_to_deamon_with_fd(&s->ctx, ctrl_fd) < 0) {
             LOGE("connect_to_deamon_with_fd failed");
+            pthread_mutex_unlock(&s->input_lock);
             return -1;
         }
     } else if (connect_to_deamon(&s->ctx, sock) < 0) {
         LOGE("connect_to_deamon failed");
+        pthread_mutex_unlock(&s->input_lock);
         return -1;
     }
 
     set_screen_info(s->ctx, s->screen_w, s->screen_h,
-                    PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
+                    s->dmabuf_infos[0].format, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
+    s->input_hdr_enabled = hdr_enabled;
+    send_hdr_sdr_white_locked(s);
 
     /* Register the camera service only when it was initialised (i.e. the user
      * enabled it in settings and granted CAMERA). The service_info lives in this
@@ -783,7 +1052,9 @@ static int do_connect(struct consumer_state *s)
     audio_set_ctx(s->audio, s->ctx);   /* audio fd is now live; threads pick it up via get_audio_fd */
 
     s->need_reconnect = false;
+    s->pacing.interval_start_ns = monotonic_now_ns();
     LOGI("connected");
+    pthread_mutex_unlock(&s->input_lock);
     return 0;
 }
 
@@ -862,6 +1133,11 @@ static void on_exit_fallback(void *userdata)
     }
 
     send_refresh_rate(s);
+    // The display library suppresses input while waiting for a producer. Seed
+    // the preference again after every producer reconnect, including the first.
+    pthread_mutex_lock(&s->input_lock);
+    send_hdr_sdr_white_locked(s);
+    pthread_mutex_unlock(&s->input_lock);
 
     JNIEnv *env = NULL;
     if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
@@ -896,6 +1172,8 @@ static void *render_thread_func(void *arg)
             TracyCZoneN(zConnect, "do_connect", 1);
             int rc = do_connect(s);
             TracyCZoneEnd(zConnect);
+            if (rc == CONNECT_DISPLAY_REJECTED)
+                break;
             if (rc < 0) {
                 usleep(500000);
                 continue;
@@ -907,9 +1185,23 @@ static void *render_thread_func(void *arg)
         TracyCZoneN(zDequeue, "dequeueBuffer", 1);
         int dq = api.dequeueBuffer(s->window, &anb, &acqfence);
         TracyCZoneEnd(zDequeue);
+        const uint64_t dequeued_ns = monotonic_now_ns();
         if (dq != 0 || !anb) {
+            if (acqfence >= 0)
+                close(acqfence);
+            if (s->active_hdr_enabled) {
+                reject_hdr_display(s, 2);
+                break;
+            }
             usleep(16000);
             continue;
+        }
+        if (s->active_hdr_enabled && (uint32_t)anb->format != s->pixel_format) {
+            if (acqfence >= 0)
+                close(acqfence);
+            api.cancelBuffer(s->window, anb, -1);
+            reject_hdr_display(s, 2);
+            break;
         }
         /* Emulate ANativeWindow_lock: CPU-wait the acquire fence so the buffer is
          * already safe to write (SurfaceFlinger done reading the previous frame)
@@ -917,7 +1209,11 @@ static void *render_thread_func(void *arg)
         if (acqfence >= 0) {
             TracyCZoneN(zAcqFence, "acquire fence wait", 1);
             struct pollfd fpfd = { .fd = acqfence, .events = POLLIN };
+            const uint64_t wait_start_ns = monotonic_now_ns();
             poll(&fpfd, 1, 1000);
+            const uint64_t wait_end_ns = monotonic_now_ns();
+            if (wait_end_ns >= wait_start_ns)
+                pacing_add(&s->pacing.acquire_fence_wait, wait_end_ns - wait_start_ns);
             close(acqfence);
             TracyCZoneEnd(zAcqFence);
         }
@@ -931,16 +1227,26 @@ static void *render_thread_func(void *arg)
         }
 
         if (idx < 0) {
-            api.queueBuffer(s->window, anb, -1);
+            if (s->active_hdr_enabled) {
+                api.cancelBuffer(s->window, anb, -1);
+                reject_hdr_display(s, 2);
+                break;
+            }
+            queue_surface_buffer(s, anb, -1, -1, 0);
             usleep(16000);
             continue;
         }
+
+        if (s->buffer_queued_at_ns[idx] && dequeued_ns >= s->buffer_queued_at_ns[idx])
+            pacing_add(&s->pacing.buffer_reuse,
+                       dequeued_ns - s->buffer_queued_at_ns[idx]);
+        s->buffer_queued_at_ns[idx] = 0;
 
         TracyCZoneN(zSelect, "select_dmabuf", 1);
         int sel = select_dmabuf(s->ctx, idx);
         TracyCZoneEnd(zSelect);
         if (sel < 0) {
-            api.queueBuffer(s->window, anb, -1);
+            queue_surface_buffer(s, anb, -1, idx, 0);
             usleep(16000);
             continue;
         }
@@ -950,9 +1256,19 @@ static void *render_thread_func(void *arg)
          * before scanout -- this lets the producer submit before its GPU render
          * completes (no glFinish stall). rfence == -1 falls back to "ready now". */
         TracyCZoneN(zRefresh, "refresh_done (producer render)", 1);
+        const uint64_t wait_start_ns = monotonic_now_ns();
         int rfence = refresh_done(s->ctx);
+        const uint64_t completion_ns = monotonic_now_ns();
         TracyCZoneEnd(zRefresh);
-        api.queueBuffer(s->window, anb, rfence);
+        if (completion_ns >= wait_start_ns) {
+            s->pacing.producer_waits++;
+            pacing_add(&s->pacing.producer_wait, completion_ns - wait_start_ns);
+        }
+        int queue_rc = queue_surface_buffer(s, anb, rfence, idx, completion_ns);
+        if (queue_rc != 0 && s->active_hdr_enabled) {
+            reject_hdr_display(s, 2);
+            break;
+        }
         TracyCFrameMark;
     }
 
@@ -990,9 +1306,13 @@ Java_com_anland_consumer_Native_nativeCreate(JNIEnv *env, jclass clazz)
     if (!s)
         return 0;
     pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->input_lock, NULL);
     pthread_mutex_init(&s->cfg_lock, NULL);
     pthread_mutex_init(&s->topapp_lock, NULL);
     s->cfg_topapp_mode = 1;
+    s->cfg_hdr_sdr_white_nits = (int)ANLAND_HDR_SDR_WHITE_NITS;
+    for (int i = 0; i < MAX_COLLECT_BUFS; i++)
+        s->dmabuf_fds[i] = -1;
     strncpy(s->cfg_socket_path, "/data/local/tmp/display_daemon.sock",
             sizeof(s->cfg_socket_path) - 1);
     s->audio = audio_create();
@@ -1020,8 +1340,10 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
         stop_event_thread(s);
         join_event_thread(s);
         topapp_restore_tree(s);
+        pthread_mutex_lock(&s->input_lock);
         disconnect(s->ctx);
         s->ctx = NULL;
+        pthread_mutex_unlock(&s->input_lock);
     } else {
         topapp_restore_tree(s);
     }
@@ -1052,6 +1374,7 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
     s->activity_obj = NULL;
     pthread_mutex_destroy(&s->topapp_lock);
     pthread_mutex_destroy(&s->cfg_lock);
+    pthread_mutex_destroy(&s->input_lock);
     pthread_mutex_destroy(&s->lock);
     LOGI("instance %p destroyed", (void *)s);
     free(s);
@@ -1073,7 +1396,7 @@ JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeConfigure(
     JNIEnv *env, jclass clazz, jlong handle, jstring socketPath, jboolean useRoot,
     jstring helperPath, jstring bridgePath, jboolean topappEnable, jstring topappPath,
-    jint topappMode, jstring topappStops)
+    jint topappMode, jstring topappStops, jboolean hdrEnabled, jboolean hdr10Supported)
 {
     struct consumer_state *s = STATE(handle);
     if (!s)
@@ -1084,6 +1407,8 @@ Java_com_anland_consumer_Native_nativeConfigure(
     if (tmp[0] != '\0')
         memcpy(s->cfg_socket_path, tmp, sizeof(s->cfg_socket_path));
     s->cfg_use_root = (useRoot == JNI_TRUE);
+    s->cfg_hdr_enabled = (hdrEnabled == JNI_TRUE);
+    s->cfg_hdr10_supported = (hdr10Supported == JNI_TRUE);
     copy_jstring(env, helperPath, s->cfg_helper_path, sizeof(s->cfg_helper_path));
     copy_jstring(env, bridgePath, s->cfg_bridge_path, sizeof(s->cfg_bridge_path));
     s->cfg_topapp_enable = (topappEnable == JNI_TRUE);
@@ -1104,6 +1429,26 @@ Java_com_anland_consumer_Native_nativeConfigure(
 }
 
 JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSetHdrSdrWhiteNits(
+    JNIEnv *env, jclass clazz, jlong handle, jint nits)
+{
+    (void)env; (void)clazz;
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    if (nits < (int)ANLAND_HDR_SDR_WHITE_MIN_NITS)
+        nits = (int)ANLAND_HDR_SDR_WHITE_MIN_NITS;
+    if (nits > (int)ANLAND_HDR_SDR_WHITE_MAX_NITS)
+        nits = (int)ANLAND_HDR_SDR_WHITE_MAX_NITS;
+    pthread_mutex_lock(&s->cfg_lock);
+    s->cfg_hdr_sdr_white_nits = nits;
+    pthread_mutex_unlock(&s->cfg_lock);
+    pthread_mutex_lock(&s->input_lock);
+    send_hdr_sdr_white_locked(s);
+    pthread_mutex_unlock(&s->input_lock);
+}
+
+JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeSetCustomResolution(
     JNIEnv* env, jclass clazz, jlong handle, jint width, jint height)
 {
@@ -1118,6 +1463,20 @@ Java_com_anland_consumer_Native_nativeSetCustomResolution(
 }
 
 JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSetScreenSize(
+    JNIEnv *env, jclass clazz, jlong handle, jint width, jint height)
+{
+    (void)env; (void)clazz;
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->cfg_lock);
+    s->cfg_screen_width = width;
+    s->cfg_screen_height = height;
+    pthread_mutex_unlock(&s->cfg_lock);
+}
+
+JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeStart(
     JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
     jobject activityTarget)
@@ -1126,9 +1485,15 @@ Java_com_anland_consumer_Native_nativeStart(
     if (!s)
         return;
 
+    pthread_mutex_lock(&s->cfg_lock);
+    bool hdr_enabled = s->cfg_hdr_enabled;
+    pthread_mutex_unlock(&s->cfg_lock);
+
     if (!api_loaded) {
         if (anw_api_load(&api) < 0) {
             LOGE("failed to load ANativeWindow hidden API");
+            if (hdr_enabled)
+                call_display_error(env, activityTarget, 2);
             return;
         }
         api_loaded = true;
@@ -1144,8 +1509,10 @@ Java_com_anland_consumer_Native_nativeStart(
     }
 
     if (s->ctx) {
+        pthread_mutex_lock(&s->input_lock);
         disconnect(s->ctx);
         s->ctx = NULL;
+        pthread_mutex_unlock(&s->input_lock);
     }
     s->motion_has_last = false;
     cleanup_dmabufs(s);
@@ -1158,6 +1525,8 @@ Java_com_anland_consumer_Native_nativeStart(
     s->window = ANativeWindow_fromSurface(env, surface);
     if (!s->window) {
         LOGE("ANativeWindow_fromSurface failed");
+        if (hdr_enabled)
+            call_display_error(env, activityTarget, 2);
         pthread_mutex_unlock(&s->lock);
         return;
     }
@@ -1216,8 +1585,10 @@ Java_com_anland_consumer_Native_nativeStop(
         stop_event_thread(s);
         join_event_thread(s);
         topapp_restore_tree(s); /* stopping the pipeline ends the boost */
+        pthread_mutex_lock(&s->input_lock);
         disconnect(s->ctx);
         s->ctx = NULL;
+        pthread_mutex_unlock(&s->input_lock);
     } else {
         topapp_restore_tree(s);
     }
@@ -1267,13 +1638,13 @@ Java_com_anland_consumer_Native_nativeSendTouch(
     JNIEnv *env, jclass clazz, jlong handle, jint action, jfloat x, jfloat y, jint pointer_id)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
     struct InputEvent ev = {
         .type = INPUT_TYPE_TOUCH,
         .touch = { .action = action, .x = x, .y = y, .pointer_id = pointer_id },
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
 }
 
 JNIEXPORT void JNICALL
@@ -1281,12 +1652,12 @@ Java_com_anland_consumer_Native_nativeSendTouchFrame(
     JNIEnv *env, jclass clazz, jlong handle)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
     struct InputEvent ev = {
         .type = INPUT_TYPE_TOUCH_FRAME,
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
 }
 
 JNIEXPORT void JNICALL
@@ -1294,13 +1665,13 @@ Java_com_anland_consumer_Native_nativeSendKey(
     JNIEnv *env, jclass clazz, jlong handle, jint action, jint keycode)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
     struct InputEvent ev = {
         .type = INPUT_TYPE_KEY,
         .key = { .action = action, .keycode = keycode },
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
 }
 
 JNIEXPORT void JNICALL
@@ -1308,8 +1679,14 @@ Java_com_anland_consumer_Native_nativeSendMouseMotion(
     JNIEnv *env, jclass clazz, jlong handle, jfloat x, jfloat y, jfloat dx, jfloat dy)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
+
+    pthread_mutex_lock(&s->input_lock);
+    if (!s->ctx) {
+        pthread_mutex_unlock(&s->input_lock);
+        return;
+    }
 
     if (dx == 0.0f && dy == 0.0f && s->motion_has_last) {
         dx = x - s->motion_last_x;
@@ -1325,6 +1702,7 @@ Java_com_anland_consumer_Native_nativeSendMouseMotion(
         .pointer_motion = { .x = x, .y = y, .dx = dx, .dy = dy },
     };
     push_input_event(s->ctx, &ev);
+    pthread_mutex_unlock(&s->input_lock);
 }
 
 JNIEXPORT void JNICALL
@@ -1332,27 +1710,101 @@ Java_com_anland_consumer_Native_nativeSendMouseButton(
     JNIEnv *env, jclass clazz, jlong handle, jint button, jboolean pressed)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
     struct InputEvent ev = {
         .type = INPUT_TYPE_POINTER_BUTTON,
         .pointer_button = { .button = button, .pressed = pressed ? 1 : 0 },
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
 }
+
+
 
 JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeSendMouseScroll(
     JNIEnv *env, jclass clazz, jlong handle, jint axis, jfloat value)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
     struct InputEvent ev = {
         .type = INPUT_TYPE_POINTER_AXIS,
         .pointer_axis = { .axis = axis, .value = value, .discrete = 0 },
     };
-    push_input_event(s->ctx, &ev);
+    send_input_event(s, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendTabletSample(
+    JNIEnv *env, jclass clazz, jlong handle, jint tool_id, jint tool_type,
+    jint capabilities, jint device_id, jfloat x, jfloat y, jfloat pressure,
+    jfloat tilt_x, jfloat tilt_y, jfloat distance, jint flags, jint buttons,
+    jlong time_msec)
+{
+    (void)env; (void)clazz;
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+
+    uint32_t frame_flags = (uint32_t)flags;
+    uint32_t frame_buttons = (uint32_t)buttons;
+    if (frame_flags & TABLET_FLAG_CANCELED) {
+        frame_flags = TABLET_FLAG_CANCELED;
+        frame_buttons = 0;
+        pressure = 0.0f;
+    } else if (!(frame_flags & TABLET_FLAG_PROXIMITY)) {
+        frame_flags = 0;
+        frame_buttons = 0;
+        pressure = 0.0f;
+    }
+
+    struct InputEvent tool = {
+        .type = INPUT_TYPE_TABLET_TOOL,
+        .tablet_tool = {
+            .tool_id = (uint32_t)tool_id,
+            .tool_type = (uint32_t)tool_type,
+            .capabilities = (uint32_t)capabilities,
+            .device_id = (uint32_t)device_id,
+        },
+    };
+    struct InputEvent position = {
+        .type = INPUT_TYPE_TABLET_POSITION,
+        .tablet_position = {
+            .tool_id = (uint32_t)tool_id,
+            .x = x,
+            .y = y,
+            .pressure = pressure,
+        },
+    };
+    struct InputEvent tilt = {
+        .type = INPUT_TYPE_TABLET_TILT,
+        .tablet_tilt = {
+            .tool_id = (uint32_t)tool_id,
+            .tilt_x = tilt_x,
+            .tilt_y = tilt_y,
+            .distance = distance,
+        },
+    };
+    struct InputEvent frame = {
+        .type = INPUT_TYPE_TABLET_FRAME,
+        .tablet_frame = {
+            .tool_id = (uint32_t)tool_id,
+            .flags = frame_flags,
+            .buttons = frame_buttons,
+            .time_msec = (uint32_t)time_msec,
+        },
+    };
+
+    pthread_mutex_lock(&s->input_lock);
+    if (s->ctx) {
+        /* Repeat TOOL metadata so a new connection always sees it before axes. */
+        if (push_input_event(s->ctx, &tool) == 0
+                && push_input_event(s->ctx, &position) == 0
+                && push_input_event(s->ctx, &tilt) == 0)
+            push_input_event(s->ctx, &frame); /* FRAME commits this sample. */
+    }
+    pthread_mutex_unlock(&s->input_lock);
 }
 
 JNIEXPORT void JNICALL
@@ -1360,7 +1812,7 @@ Java_com_anland_consumer_Native_nativeSendClipboard(
     JNIEnv *env, jclass clazz, jlong handle, jbyteArray data)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
 
     jsize len = (*env)->GetArrayLength(env, data);
@@ -1376,7 +1828,7 @@ Java_com_anland_consumer_Native_nativeSendClipboard(
         .type = INPUT_TYPE_CLIPBOARD,
         .clipboard = { .size = (uint32_t)len },
     };
-    push_input_event_with_length(s->ctx, &ev, buf, len);
+    send_input_payload(s, &ev, buf, len);
     free(buf);
 }
 
@@ -1385,7 +1837,7 @@ Java_com_anland_consumer_Native_nativeSendTextInput(
     JNIEnv *env, jclass clazz, jlong handle, jbyteArray data)
 {
     struct consumer_state *s = STATE(handle);
-    if (!s || !s->ctx)
+    if (!s)
         return;
 
     jsize len = (*env)->GetArrayLength(env, data);
@@ -1401,7 +1853,7 @@ Java_com_anland_consumer_Native_nativeSendTextInput(
         .type = INPUT_TYPE_TEXT_INPUT,
         .text_input = { .size = (uint32_t)len },
     };
-    push_input_event_with_length(s->ctx, &ev, buf, len);
+    send_input_payload(s, &ev, buf, len);
     free(buf);
 }
 

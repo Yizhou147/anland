@@ -12,12 +12,16 @@ import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
+import android.hardware.input.InputManager;
 import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.SparseArray;
 import android.view.Display;
@@ -38,14 +42,20 @@ import android.widget.FrameLayout;
 import android.util.DisplayMetrics;   // ADDED
 
 import java.nio.charset.StandardCharsets;
-
+import java.util.Arrays;
 
 public class MainActivity extends Activity
         implements SurfaceHolder.Callback, SystemIME.Host, ImmersiveMode.Host {
     private static final String TAG = "Anland";
+    private static final String KEY_USE_HUD_OVERLAY = "use_hud_overlay";
 
     private SurfaceView surfaceView;
     private boolean surfaceReady = false;
+    // Snapshotted for this window: changing the setting must never switch only
+    // the Android end while its paired KDE compositor is still running.
+    private boolean hdrEnabled;
+    private boolean displayFailed;
+    static final String KEY_EXPERIMENTAL_HDR = "experimental_hdr";
     // System-clipboard bridge; also the target for the native clipboard callbacks.
     private Clipboard clipboard;
     private static final String PREFS_NAME = "anland_settings";
@@ -53,6 +63,12 @@ public class MainActivity extends Activity
     private int customScreenHeight = 0;
     private int viewWidth = 0;
     private int viewHeight = 0;
+    private static final long RECONNECT_DEBOUNCE_MS = 350L;
+    private static final long RECONNECT_COOLDOWN_MS = 1200L;
+    private Runnable pendingReconnect;
+    private long lastReconnectTimeMs;
+    private int connectedW;
+    private int connectedH;
     private static final String KEY_BOUND_KEYCODE = "bound_keycode";
     private static final String KEY_SOCKET_PATH = "socket_path";
     private static final String KEY_USE_ROOT = "use_root";
@@ -79,6 +95,54 @@ public class MainActivity extends Activity
     static final String EXTRA_WINDOW_NAME = "window_name";
     // This window's own native transport instance (its own consumer_state handle).
     private Native mNative;
+    // Keep the listener strongly referenced for this window's entire lifetime.
+    // Paused HDR windows must also receive changes made from Settings.
+    private final SharedPreferences.OnSharedPreferenceChangeListener hdrBrightnessListener =
+            (prefs, key) -> {
+                if (HdrBrightness.KEY_SDR_WHITE_NITS.equals(key))
+                    applyHdrBrightness(prefs);
+            };
+
+    private void applyHdrBrightness(SharedPreferences prefs) {
+        if (hdrEnabled && mNative != null)
+            mNative.setHdrSdrWhiteNits(HdrBrightness.clamp(prefs.getInt(
+                    HdrBrightness.KEY_SDR_WHITE_NITS, HdrBrightness.DEFAULT_NITS)));
+    }
+    private final TabletInput tabletInput = new TabletInput(frame -> {
+        if (mNative != null) {
+            mNative.sendTabletSample(frame.toolId, frame.toolType, frame.capabilities,
+                    frame.deviceId, frame.x, frame.y, frame.pressure,
+                    frame.tiltX, frame.tiltY, frame.distance,
+                    frame.flags, frame.buttons, frame.timeMsec);
+        }
+    });
+    private final InputManager.InputDeviceListener tabletDeviceListener =
+            new InputManager.InputDeviceListener() {
+                @Override public void onInputDeviceAdded(int deviceId) { }
+
+                @Override public void onInputDeviceRemoved(int deviceId) {
+                    tabletInput.cancelDevice(deviceId, SystemClock.uptimeMillis());
+                }
+
+                @Override public void onInputDeviceChanged(int deviceId) {
+                    tabletInput.cancelDevice(deviceId, SystemClock.uptimeMillis());
+                }
+            };
+    private InputManager tabletInputManager;
+    private boolean tabletDeviceListenerRegistered;
+    private static final int MAX_RAW_TABLET_DEVICES = 32;
+    private final int[] rawTabletDeviceIds = new int[MAX_RAW_TABLET_DEVICES];
+    private int nextRawTabletDeviceId = 1;
+    private final TouchLedger forwardedTouches = new TouchLedger(new TouchLedger.Sender() {
+        @Override public void touch(int action, int id, float x, float y) {
+            if (mNative != null)
+                mNative.sendTouch(action, x, y, id);
+        }
+        @Override public void frame() {
+            if (mNative != null)
+                mNative.sendTouchFrame();
+        }
+    });
     // Media audio focus for this window (volume keys + playback priority).
     private AudioManager mAudioManager;
     private AudioFocusRequest mAudioFocusRequest;
@@ -97,14 +161,9 @@ public class MainActivity extends Activity
     // (no pipeline was ever initialized). Makes onPause/onResume no-op-and-exit.
     private boolean mForceSettings = false;
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
-    private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
-    private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
-    private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     // Linux input-event-codes.h: KEY_BACK (the browser-back key).
-    private static final int EVDEV_BROWSER_BACK = 158;
-    // When on, the IME and extra-keys bar float over the display instead of
-    // shrinking it: the bar rides up with the keyboard but the surface keeps
-    // its full size. See relayout() and buildExtraKeysBar().
+    // When on, the soft keyboard floats over the display instead of shrinking
+    // it, so the surface keeps its full size. See relayout().
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private boolean mKeyboardFloating = false;
     // Persistent "tap to open Settings" notification, toggleable in Settings > General.
@@ -117,12 +176,16 @@ public class MainActivity extends Activity
     // System soft-keyboard bridge: hidden input, text forwarding and toggle.
     private SystemIME systemIme;
     private int mImeBottom = 0;   // last IME bottom inset
-    private int mBarHeight = 0;   // extra-keys bar height in px
-    private ExtraKeysBar extraKeysBar;
-    private FrameLayout mRoot;    // content root, host of the extra-keys bar
+    private com.anland.consumer.hud.HudOverlayView mHudOverlay;
+    private FrameLayout mRoot;    // content root, host of the HUD overlay
+    // Pointer ids of the grabbed evdev stream that belong to the HUD or the
+    // floating keyboard rather than to the desktop.
+    private final java.util.HashSet<Integer> grabbedOverlayPointers = new java.util.HashSet<>();
+    // Cached "immersive_hud_touch" preference: read once per session instead of
+    // once per evdev frame.
+    private boolean immersiveHudTouch = ImmersiveMode.DEFAULT_HUD_TOUCH;
     private float mDensity = 1f;
     // Layout JSON the current bar was built from; used to detect edits on resume.
-    private String mAppliedLayoutJson = "";
 
     public static MainActivity sInstance;
 
@@ -144,6 +207,11 @@ public class MainActivity extends Activity
     // 默认开启。双指滚动与双指右键点击不受影响。
     public static final String KEY_DISABLE_MULTI_FINGER_GESTURES =
             "disable_multi_finger_gestures";
+    // Physical touchpad tap filtering. The scroll guard is measured from the
+    // last scrolling event until the next deliberate tap.
+    public static final String KEY_PAD_TAP = "pad_tap";
+    public static final String KEY_PAD_SCROLL_GUARD_MS = "pad_scroll_guard_ms";
+    public static final String KEY_PAD_DEBUG = "pad_debug";
     // Capture an external mouse/touchpad as a relative pointer so it cannot reach
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
@@ -192,6 +260,8 @@ public class MainActivity extends Activity
     // Raw hardware-touchpad coordinate state while pointer capture is active.
     // Gesture recognition itself belongs to Touchpad above.
     private float capturedTouchpadAccel = 1.0f;
+    /** Raw mouse speed at which half of the configured acceleration is applied. */
+    private static final float RELATIVE_ACCEL_REFERENCE_COUNTS_PER_S = 1000f;
     private boolean capturedTouchpadBaselineValid = false;
     private int capturedTouchpadBaselinePointers = 0;
     private float capturedTouchpadLastCentroidX = 0f;
@@ -216,8 +286,10 @@ public class MainActivity extends Activity
     // reaches Android at all, and their events are replayed onto the desktop
     // through the same paths as the on-screen ones. Off unless the user both
     // enables it in Settings and presses the key they bound to it.
-    private ImmersiveMode immersive;
+    private ImmersiveInputController immersive;
     private boolean immersiveActive = false;
+    private boolean mResumed = false;
+    private boolean touchscreenGrabbed;
     // Cached display rotation. A grabbed touchscreen reports in the panel's own
     // fixed frame, so the rotation has to be undone before its coordinates mean
     // anything on screen; reading it per contact would be wasteful.
@@ -239,6 +311,8 @@ public class MainActivity extends Activity
                 if (d != null && d.getDisplayId() == displayId) {
                     pushRefreshRate();
                     updateDisplayRotation();
+                    if (hdrEnabled && !supportsHdr10())
+                        onDisplayError(1);
                 }
             }
         };
@@ -250,39 +324,52 @@ public class MainActivity extends Activity
             displayRotation = d.getRotation();
     }
 
-    // Called from native on_fallback (display lib dropped the connection). Runs on a
-    // native worker thread, so hop to the UI thread before touching the toast/finish.
-    // If the daemon socket is gone the daemon really went down, so close this window.
+    // Called from native on_fallback (display lib dropped the connection). Always
+    // enqueue the UI work: this can be called inline from push_input_event while a
+    // JNI sender holds input_lock, and cancelAll sends back through that same lock.
+    // The display transport already has a reconnect path; only close this window
+    // after repeated root probes agree that the producer socket is really gone.
     public void onFallback(){
-        runOnUiThread(() -> {
+        Log.w(TAG, "display transport fallback");
+        lifecycleHandler.post(() -> {
             // The producer connection is gone: every consumer var regresses to 0.
             // The producer resends the current value once it reconnects.
+            tabletInput.cancelAll(SystemClock.uptimeMillis());
+            resetTabletIdentitySession();
             captureMouseForced = false;
             if (mRoot != null)
                 mRoot.post(this::syncPointerCapture);
-            if (!isSocketFile(resolveSocketPath())) {
-                //exit
-                android.widget.Toast.makeText(this, "Deamon Down",
-                        android.widget.Toast.LENGTH_SHORT).show();
-                finish();
-            }
+            probeDaemonAsync();
         });
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (!isSocketFile(resolveSocketPath())) {
-            //exit
-            android.widget.Toast.makeText(this, "Deamon Down",
-                    android.widget.Toast.LENGTH_SHORT).show();
-            finish();
-        }
         if (hasFocus) {
+            lifecycleHandler.removeCallbacks(delayedFocusStop);
+            scheduleAutomaticImmersiveEntry();
             // Become the accessibility-key target and the focused instance, so real
             // camera frames route to this window (others get blank frames).
             sInstance = this;
             if (mNative != null) mNative.setFocused(true);
+            // Automatic immersive entry can happen from onResume() before the
+            // window has received its first focus callback. Retry the policy lease
+            // here when that session is still active.
+            if (immersiveActive && mResumed && isOplusRefreshRateLockEnabled())
+                OplusRefreshRateLease.acquire(this);
+        } else if (immersive != null && mResumed) {
+            // Focus can flicker during a SurfaceView/display transition. Give the
+            // window a short chance to regain focus before releasing input; a real
+            // pause still tears the session down in onPause().
+            Log.i(TAG, "window focus lost; delaying immersive stop");
+            lifecycleHandler.removeCallbacks(delayedFocusStop);
+            lifecycleHandler.postDelayed(delayedFocusStop, FOCUS_STOP_DELAY_MS);
+        }
+        if (!hasFocus) {
+            cancelOverlayTouches();
+            tabletInput.cancelAll(SystemClock.uptimeMillis());
+            releaseAllMouseButtons();
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
@@ -294,26 +381,57 @@ public class MainActivity extends Activity
                 clearPointerCaptureBackTracking();
                 releasePointerCapture(false);
                 // A freeform / small-window IME floats and can be dismissed by
-                // tapping outside the window with no WindowInsets change, so the
-                // extra-keys bar would stay up. Sync it with the keyboard state
-                // here; SystemIME's toggle flag is reconciled at the same time so
-                // the next toggle press acts on the real state.
+                // tapping outside the window with no WindowInsets change, so
+                // reconcile SystemIME's toggle flag here: the next toggle press
+                // must act on the real state.
                 if (systemIme != null)
                     systemIme.markImeVisible(false);
-                setExtraKeysBarVisible(shouldShowBar(false));
             }
         }
-        // Losing focus means something else is on screen (a system dialog, a
-        // call). Holding an exclusive grab on every input device through that
-        // would leave the user with nothing to answer it with.
-        if (!hasFocus && immersive != null)
-            immersive.stop();
     }
 
     private void pushRefreshRate() {
         Display d = getDisplay();
         if (d != null)
             mNative.setRefreshRate(d.getRefreshRate());
+    }
+
+    @SuppressWarnings("deprecation")
+    private boolean supportsHdr10() {
+        Display display = getDisplay();
+        if (display == null)
+            return false;
+        int[] types;
+        if (Build.VERSION.SDK_INT >= 34) {
+            types = display.getMode().getSupportedHdrTypes();
+        } else {
+            Display.HdrCapabilities caps = display.getHdrCapabilities();
+            types = caps == null ? new int[0] : caps.getSupportedHdrTypes();
+        }
+        for (int type : types) {
+            if (type == Display.HdrCapabilities.HDR_TYPE_HDR10)
+                return true;
+        }
+        return false;
+    }
+
+    // Called by the native render thread. A failed HDR request is terminal for
+    // this window; falling back independently would mislabel KDE's PQ pixels.
+    public void onDisplayError(int error) {
+        lifecycleHandler.post(() -> {
+            if (displayFailed || isFinishing() || isDestroyed())
+                return;
+            displayFailed = true;
+            Log.e(TAG, "HDR display connection rejected: " + error);
+            stopNativePipeline();
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle(R.string.hdr_error_title)
+                    .setMessage(error == 1 ? R.string.hdr_error_unsupported
+                                          : R.string.hdr_error_surface)
+                    .setCancelable(false)
+                    .setPositiveButton(android.R.string.ok, (dialog, which) -> finish())
+                    .show();
+        });
     }
 
     // Push the current connection settings (socket path / root mode) to native
@@ -333,7 +451,8 @@ public class MainActivity extends Activity
         String topAppStops = prefs.getString(KEY_TOPAPP_STOPS, "").trim();
         String topAppPath = getApplicationInfo().nativeLibraryDir + "/libsettopapp.so";
         mNative.configure(sock, useRoot, helperPath, bridgePath, topApp, topAppPath,
-                topAppMode, topAppStops);
+                topAppMode, topAppStops, hdrEnabled, supportsHdr10());
+        applyHdrBrightness(prefs);
         int customW = prefs.getInt("custom_width", 0);
         int customH = prefs.getInt("custom_height", 0);
         customScreenWidth = prefs.getInt("custom_width", 0);
@@ -358,13 +477,99 @@ public class MainActivity extends Activity
     // socket is still a live socket. The daemon can go down after launch, so
     // re-check on every (re)connect; if it is gone, report it and exit the window.
     private void startNative(android.view.Surface surface) {
+        if (displayFailed)
+            return;
+        if (hdrEnabled && !supportsHdr10()) {
+            onDisplayError(1);
+            return;
+        }
         if (!isSocketFile(resolveSocketPath())) {
             android.widget.Toast.makeText(this, "Deamon Down",
                     android.widget.Toast.LENGTH_SHORT).show();
             finish();
             return;
         }
+        if (viewWidth > 0 && viewHeight > 0)
+            mNative.setScreenSize(viewWidth, viewHeight);
         mNative.start(surface, clipboard, this);
+        connectedW = viewWidth;
+        connectedH = viewHeight;
+        lastReconnectTimeMs = android.os.SystemClock.uptimeMillis();
+    }
+
+    private void cancelPendingReconnect() {
+        if (pendingReconnect != null) {
+            lifecycleHandler.removeCallbacks(pendingReconnect);
+            pendingReconnect = null;
+        }
+    }
+
+    private void stopNativePipeline() {
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
+        cancelOverlayTouches();
+        cancelPendingReconnect();
+        if (mNative != null)
+            mNative.stop();
+        resetTabletIdentitySession();
+        connectedW = 0;
+        connectedH = 0;
+    }
+
+    private void scheduleReconnect(SurfaceHolder holder) {
+        if (displayFailed)
+            return;
+        final android.view.Surface surface = holder.getSurface();
+        if (surface == null || !surface.isValid())
+            return;
+        cancelPendingReconnect();
+        pendingReconnect = () -> {
+            pendingReconnect = null;
+            reconnectNow(surface);
+        };
+        if (connectedW == 0 && connectedH == 0)
+            lifecycleHandler.post(pendingReconnect);
+        else
+            lifecycleHandler.postDelayed(pendingReconnect, RECONNECT_DEBOUNCE_MS);
+    }
+
+    private void reconnectNow(android.view.Surface surface) {
+        if (displayFailed || !surfaceReady || mNative == null || surface == null || !surface.isValid())
+            return;
+        long now = android.os.SystemClock.uptimeMillis();
+        if (viewWidth == connectedW && viewHeight == connectedH
+                && now - lastReconnectTimeMs < RECONNECT_COOLDOWN_MS)
+            return;
+
+        updateDisplayRotation();
+        ensurePointerPosition();
+        applyCameraState();
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
+        releaseScreenTouches();
+        mNative.stop();
+        resetTabletIdentitySession();
+        connectedW = 0;
+        connectedH = 0;
+        applyConnectionConfig();
+        startNative(surface);
+        pushRefreshRate();
+        applyMicState();
+        applyAudioLatency();
+        applyAudioKeepalive();
+    }
+
+    private void syncScreenSizeToSurface() {
+        if (!surfaceReady || mNative == null || surfaceView == null)
+            return;
+        int width = surfaceView.getWidth();
+        int height = surfaceView.getHeight();
+        if (width <= 0 || height <= 0 || (width == viewWidth && height == viewHeight))
+            return;
+        viewWidth = width;
+        viewHeight = height;
+        mNative.setScreenSize(width, height);
+        updateDisplayRotation();
+        updateTouchpadBounds(null);
+        scheduleReconnect(surfaceView.getHolder());
     }
 
     // True only when `path` exists and is a unix-domain socket. In root mode the
@@ -391,23 +596,148 @@ public class MainActivity extends Activity
         }
     }
 
+    /** How long a rooted socket probe may take before it is abandoned. */
+    private static final long SU_PROBE_TIMEOUT_MS = 3000L;
+
     // Probe the socket from root context via the bundled helper's "test" mode.
-    // Exit 0 means the path exists and is a unix socket; anything else (including
-    // su being unavailable / denied, which throws) counts as "no socket".
-    private boolean isSocketFileRoot(String path) {
+    // Exit 0 means the path exists and is a unix socket; a clean non-zero exit
+    // means it is gone.
+    //
+    // A probe that cannot answer -- su slow, refused, or waiting on a permission
+    // prompt -- is *not* the same as a socket that is gone, which is why this
+    // answers in three states rather than two. Treating "could not tell" as
+    // "gone" closes a window that was working perfectly.
+    private Boolean probeSocketRoot(String path) {
         String helperPath = getApplicationInfo().nativeLibraryDir + "/libfdhelper.so";
         Process p = null;
         try {
-            p = new ProcessBuilder("su", "-c", helperPath + " " + path + " test")
+            // `path` is not ours: it comes from the saved preference, which is
+            // editable, or from the launch Intent, which any app can send to
+            // this exported activity. Quoted, or a path containing a shell
+            // metacharacter is a command run as root.
+            p = new ProcessBuilder("su", "-c",
+                    SuCommand.shellQuote(helperPath) + " " + SuCommand.shellQuote(path)
+                            + " test")
                     .redirectErrorStream(true)
                     .start();
-            return p.waitFor() == 0;
+            // Bounded on purpose. Unbounded, a wedged su pins whichever thread
+            // called this for as long as it likes.
+            if (!p.waitFor(SU_PROBE_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS))
+                return null;
+            return p.exitValue() == 0;
         } catch (Exception e) {
             Log.w(TAG, "root socket probe failed: " + e);
-            return false;
+            return null;
         } finally {
             if (p != null) p.destroy();
         }
+    }
+
+    /** Whether the path is a socket, with "could not tell" folded into "no". */
+    private boolean isSocketFileRoot(String path) {
+        return Boolean.TRUE.equals(probeSocketRoot(path));
+    }
+
+    /** Guards against probes piling up while focus flips back and forth. */
+    private volatile boolean socketProbeInFlight;
+    private final Handler lifecycleHandler = new Handler(Looper.getMainLooper());
+    private static final long FOCUS_STOP_DELAY_MS = 750L;
+    private static final long SURFACE_STOP_DELAY_MS = 750L;
+    private static final long SOCKET_PROBE_RETRY_MS = 400L;
+    private static final int SOCKET_PROBE_FAILURES_TO_CLOSE = 3;
+    private int socketProbeFailures;
+    private final AutomaticImmersiveEntry automaticImmersive = new AutomaticImmersiveEntry();
+    private final Runnable automaticImmersiveEntry = this::tryAutomaticImmersiveEntry;
+
+    private void armAutomaticImmersiveEntry() {
+        automaticImmersive.arm(android.os.SystemClock.uptimeMillis());
+        scheduleAutomaticImmersiveEntry();
+    }
+
+    private void scheduleAutomaticImmersiveEntry() {
+        lifecycleHandler.removeCallbacks(automaticImmersiveEntry);
+        if (automaticImmersive.canAttempt(mResumed, surfaceReady, hasWindowFocus()))
+            lifecycleHandler.post(automaticImmersiveEntry);
+    }
+
+    private void tryAutomaticImmersiveEntry() {
+        if (!automaticImmersive.canAttempt(mResumed, surfaceReady, hasWindowFocus())
+                || immersive == null)
+            return;
+        boolean completed = immersive.enterAutomatically();
+        if (automaticImmersive.retry(completed, android.os.SystemClock.uptimeMillis()))
+            lifecycleHandler.postDelayed(automaticImmersiveEntry, 500L);
+        else if (!completed)
+            Log.w(TAG, "automatic immersive entry: input did not become ready");
+    }
+
+    private final Runnable delayedFocusStop = () -> {
+        if (!hasWindowFocus() && mResumed && immersive != null) {
+            Log.i(TAG, "focus remained lost; stopping immersive input");
+            if (immersive.isActive())
+                armAutomaticImmersiveEntry();
+            immersive.stop();
+            releaseAllForwardedKeys();
+            releaseScreenTouches();
+            OplusRefreshRateLease.release(this);
+        }
+    };
+    private final Runnable delayedSurfaceStop = () -> {
+        if (!surfaceReady && mResumed && immersive != null) {
+            Log.i(TAG, "surface remained unavailable; stopping immersive input");
+            if (immersive.isActive())
+                armAutomaticImmersiveEntry();
+            immersive.stop();
+            releaseAllForwardedKeys();
+            releaseScreenTouches();
+            OplusRefreshRateLease.release(this);
+        }
+    };
+
+    /**
+     * Checks the daemon socket without blocking the UI thread. A single failed
+     * root probe is not proof that the daemon is gone: su/SELinux and socket
+     * namespace visibility can fail transiently during a display reconnect.
+     */
+    private void probeDaemonAsync() {
+        if (socketProbeInFlight)
+            return;
+        socketProbeInFlight = true;
+        final String path = resolveSocketPath();
+        final boolean useRoot = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_USE_ROOT, true);
+        Thread worker = new Thread(() -> {
+            final Boolean present = useRoot ? probeSocketRoot(path)
+                    : Boolean.valueOf(isSocketFileLocal(path));
+            runOnUiThread(() -> {
+                socketProbeInFlight = false;
+                if (isFinishing() || isDestroyed())
+                    return;
+                if (present == null) {
+                    Log.w(TAG, "daemon socket probe inconclusive");
+                    lifecycleHandler.postDelayed(MainActivity.this::probeDaemonAsync,
+                            SOCKET_PROBE_RETRY_MS);
+                    return;
+                }
+                if (present) {
+                    socketProbeFailures = 0;
+                    return;
+                }
+                socketProbeFailures++;
+                Log.w(TAG, "daemon socket probe says missing (" + socketProbeFailures
+                        + "/" + SOCKET_PROBE_FAILURES_TO_CLOSE + ")");
+                if (socketProbeFailures < SOCKET_PROBE_FAILURES_TO_CLOSE) {
+                    lifecycleHandler.postDelayed(MainActivity.this::probeDaemonAsync,
+                            SOCKET_PROBE_RETRY_MS);
+                    return;
+                }
+                android.widget.Toast.makeText(this, "Deamon Down",
+                        android.widget.Toast.LENGTH_SHORT).show();
+                finish();
+            });
+        }, "anland-socket-probe");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     // (Re)register this window under its current socket in sWindowsBySocket. A
@@ -425,6 +755,11 @@ public class MainActivity extends Activity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        hdrEnabled = savedInstanceState != null
+                ? savedInstanceState.getBoolean(KEY_EXPERIMENTAL_HDR, false)
+                : getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                        .getBoolean(KEY_EXPERIMENTAL_HDR, false);
 
         setupMediaAudio();
         applyOrientation();
@@ -472,6 +807,9 @@ public class MainActivity extends Activity
 
         // Each window owns its own native pipeline.
         mNative = new Native();
+        SharedPreferences hdrPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        hdrPrefs.registerOnSharedPreferenceChangeListener(hdrBrightnessListener);
+        applyHdrBrightness(hdrPrefs);
         setTaskDescription(new ActivityManager.TaskDescription(mWindowName));
 
         clipboard = new Clipboard(this, mNative);
@@ -497,6 +835,54 @@ public class MainActivity extends Activity
         // this keeps capture working even while the soft keyboard owns focus.
         FrameLayout root = new FrameLayout(this) {
             @Override
+            public boolean dispatchTouchEvent(MotionEvent event) {
+                if (!containsTabletPointer(event))
+                    return super.dispatchTouchEvent(event);
+
+                // HUD children otherwise receive stylus DOWN first and can
+                // turn it into a mouse click. Route the pen at the window edge,
+                // then let only the remaining finger pointers reach the views.
+                handleTabletMotionEvent(event);
+                MotionEvent fingers = filterTabletPointers(event, false);
+                if (fingers == null)
+                    return true;
+                try {
+                    // Activity.dispatchTouchEvent normally falls back to
+                    // Activity.onTouchEvent with the original event when the
+                    // window returns false. The original still contains the pen,
+                    // which would submit the same native sample a second time.
+                    // Reproduce that fallback with the finger-only event here.
+                    if (!super.dispatchTouchEvent(fingers))
+                        MainActivity.this.onTouchEvent(fingers);
+                    return true;
+                } finally {
+                    fingers.recycle();
+                }
+            }
+
+            @Override
+            public boolean dispatchGenericMotionEvent(MotionEvent event) {
+                if (!containsTabletPointer(event))
+                    return super.dispatchGenericMotionEvent(event);
+
+                // Hover and button samples can be consumed by a HUD child just
+                // like touch DOWN; deliver the pen first at the window edge.
+                handleTabletMotionEvent(event);
+                MotionEvent fingers = filterTabletPointers(event, false);
+                if (fingers == null)
+                    return true;
+                try {
+                    // Keep Activity's fallback on the filtered event too, so
+                    // generic pen motion cannot be delivered twice.
+                    if (!super.dispatchGenericMotionEvent(fingers))
+                        MainActivity.this.onGenericMotionEvent(fingers);
+                    return true;
+                } finally {
+                    fingers.recycle();
+                }
+            }
+
+            @Override
             public boolean dispatchCapturedPointerEvent(MotionEvent event) {
                 if (handleCapturedPointerEvent(event))
                     return true;
@@ -506,6 +892,7 @@ public class MainActivity extends Activity
             @Override
             public void dispatchPointerCaptureChanged(boolean hasCapture) {
                 super.dispatchPointerCaptureChanged(hasCapture);
+                tabletInput.cancelAll(SystemClock.uptimeMillis());
                 if (!hasCapture) {
                     releaseAllMouseButtons();
                     resetCapturedTouchpadGesture();
@@ -518,26 +905,77 @@ public class MainActivity extends Activity
         // 1x1 so the IME target never overlaps the surface and steals touches.
         root.addView(systemIme.getInputView(), new FrameLayout.LayoutParams(1, 1));
 
-        // Bottom extra-keys bar (Termux-style). Hidden by default; toggled by the
-        // settings switch and synced in onResume. The layout (and thus the row
-        // count / height) comes from the user's JSON config; see buildExtraKeysBar.
         mRoot = root;
         mDensity = getResources().getDisplayMetrics().density;
         mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .getBoolean(KEY_KEYBOARD_FLOATING, true);
-        buildExtraKeysBar();
+
+        SharedPreferences hudPrefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        mHudOverlay = new com.anland.consumer.hud.HudOverlayView(this, hudPrefs,
+                new com.anland.consumer.hud.HudOverlayView.HudHost() {
+            @Override public void sendKey(int action, int evdevCode) {
+                if (mNative != null) mNative.sendKey(action, evdevCode);
+            }
+            @Override public void sendTextInput(byte[] utf8) {
+                if (mNative != null) mNative.sendTextInput(utf8);
+            }
+            @Override public void sendMouseMotion(float dx, float dy) {
+                sendCapturedTouchpadMotion(dx, dy);
+            }
+            @Override public void sendMouseButton(int button, boolean pressed) {
+                if (mNative != null) mNative.sendMouseButton(button, pressed);
+            }
+
+            @Override public void sendMouseScroll(int axis, float value) {
+                if (mNative != null) mNative.sendMouseScroll(axis, value);
+            }
+            @Override public void toggleSystemKeyboard() {
+                if (systemIme != null) systemIme.toggleSystemKeyboard();
+            }
+            @Override public void toggleVirtualKeyboard() {
+                MainActivity.this.toggleVirtualKeyboard();
+            }
+            @Override public void openSettings() {
+                startActivity(new Intent(MainActivity.this, SettingsActivity.class));
+            }
+            @Override public void onLayoutSaved() {
+                if (mRoot != null) relayout();
+            }
+            @Override public boolean isNativeReady() {
+                return mNative != null && surfaceReady;
+            }
+            @Override public void onEditModeExited() {}
+        });
+        root.addView(mHudOverlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        mHudOverlay.post(() -> {
+            if (mHudOverlay != null) mHudOverlay.rebuildActiveLayout();
+        });
 
         // ADDED: Create VirtualKeyboardView (hidden initially)
         virtualKeyboardView = new VirtualKeyboardView(this);
         virtualKeyboardView.setVisibility(View.GONE);
+        // Hiding the keyboard hands the floating layer back to the HUD.
+        virtualKeyboardView.setOnDismissListener(this::applyHudVisibility);
         virtualKeyboardView.setOnKeyEventListener(new VirtualKeyboardView.OnKeyEventListener() {
             @Override
             public void onKeyDown(int scanCode) {
-                mNative.sendKey(0, scanCode);
+                if (mNative != null) mNative.sendKey(0, scanCode);
             }
             @Override
             public void onKeyUp(int scanCode) {
-                mNative.sendKey(1, scanCode);
+                if (mNative != null) mNative.sendKey(1, scanCode);
+            }
+            @Override
+            public void onTextInput(String text) {
+                if (mNative != null && text != null && !text.isEmpty()) {
+                    mNative.sendTextInput(text.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            @Override
+            public void onScroll(float dy) {
+                if (mNative != null) mNative.sendMouseScroll(0, -dy * 0.5f);
             }
         });
         // Add to root with no gravity – we will position manually.
@@ -569,8 +1007,7 @@ public class MainActivity extends Activity
 
         setContentView(root);
         // Establish a focused descendant after attachment so the DecorView routes
-        // captured-pointer events through our content root even when the extra-keys
-        // bar is hidden.
+        // captured-pointer events through our content root.
         surfaceView.requestFocus();
         surfaceView.getHolder().addCallback(this);
 
@@ -624,7 +1061,7 @@ public class MainActivity extends Activity
         updateDisplayRotation();
         // Never starts a session by itself: the user has to enable it in Settings
         // and press the key they bound to it.
-        immersive = new ImmersiveMode(this);
+        immersive = new ImmersiveInputController(this);
 
         // Requesting capture before the window is attached is a no-op. The post
         // below covers the initial attach; onWindowFocusChanged() retries after a
@@ -668,7 +1105,34 @@ public class MainActivity extends Activity
 
     // ADDED: Helper to position virtual keyboard at bottom-center
     private void positionVirtualKeyboard() {
-        if (virtualKeyboardView == null) return;
+        if (virtualKeyboardView == null || mRoot == null) return;
+        virtualKeyboardView.updateScreenSize();
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams)
+                virtualKeyboardView.getLayoutParams();
+        if (lp == null) return;
+
+        if (virtualKeyboardView.isSplitArcMode()) {
+            if (lp.width != FrameLayout.LayoutParams.MATCH_PARENT
+                    || lp.height != FrameLayout.LayoutParams.MATCH_PARENT) {
+                lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
+                lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
+                virtualKeyboardView.setLayoutParams(lp);
+            }
+            virtualKeyboardView.setTranslationX(0f);
+            virtualKeyboardView.setTranslationY(0f);
+            return;
+        }
+
+        if (lp.width != FrameLayout.LayoutParams.WRAP_CONTENT
+                || lp.height != FrameLayout.LayoutParams.WRAP_CONTENT) {
+            lp.width = FrameLayout.LayoutParams.WRAP_CONTENT;
+            lp.height = FrameLayout.LayoutParams.WRAP_CONTENT;
+            virtualKeyboardView.setLayoutParams(lp);
+            if (virtualKeyboardView.getVisibility() == View.VISIBLE)
+                virtualKeyboardView.post(this::positionVirtualKeyboard);
+            return;
+        }
+
         int w = virtualKeyboardView.getMeasuredWidth();
         int h = virtualKeyboardView.getMeasuredHeight();
         if (w <= 0 || h <= 0) {
@@ -697,8 +1161,8 @@ public class MainActivity extends Activity
         // Clamp to visible area.
         x = Math.max(0, Math.min(x, parentW - w));
         y = Math.max(0, Math.min(y, parentH - h));
-        virtualKeyboardView.setX(x);
-        virtualKeyboardView.setY(y);
+        virtualKeyboardView.setTranslationX(x);
+        virtualKeyboardView.setTranslationY(y);
         Log.d("VirtualKeyboard", "positionVirtualKeyboard: x=" + x + ", y=" + y
                 + " parent=" + parentW + "x" + parentH + " view=" + w + "x" + h);
     }
@@ -798,6 +1262,12 @@ public class MainActivity extends Activity
     private void applyTouchpadPrefs(SharedPreferences prefs, Touchpad pad) {
         if (pad == null)
             return;
+        // Physical pads retain taps by default. Only a stream committed to
+        // scrolling (or explicitly disabled taps) suppresses synthetic clicks.
+        if (pad != screenTouchpad)
+            pad.setTapFilter(prefs.getBoolean(KEY_PAD_TAP, true),
+                    prefs.getInt(KEY_PAD_SCROLL_GUARD_MS, 0),
+                    prefs.getBoolean(KEY_PAD_DEBUG, false));
         pad.setAccelStrength(Math.max(0.5f,
                 Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f))));
         pad.setScrollSpeed(prefs.getFloat(KEY_SCROLL_SPEED,
@@ -1032,6 +1502,10 @@ public class MainActivity extends Activity
 
     /** Handle mouse and hardware-touchpad events delivered through pointer capture. */
     private boolean handleCapturedPointerEvent(MotionEvent event) {
+        if (containsTabletPointer(event)) {
+            handleTabletMotionEvent(event);
+            return true;
+        }
         // A few OEMs combine source capability bits. Prefer the touchpad path
         // whenever SOURCE_TOUCHPAD is present so raw multi-pointer events still
         // reach the gesture state machine.
@@ -1475,6 +1949,11 @@ public class MainActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        mResumed = true;
+        // Cached while the screen is up: the immersive routing must never read
+        // shared preferences from an evdev frame.
+        immersiveHudTouch = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(ImmersiveMode.KEY_HUD_TOUCH, ImmersiveMode.DEFAULT_HUD_TOUCH);
 
         // Bounced to Settings from onCreate (socket missing): nothing was set up, so
         // just exit this window instead of running the connect logic.
@@ -1482,6 +1961,14 @@ public class MainActivity extends Activity
             finish();
             return;
         }
+
+        tabletInputManager = getSystemService(InputManager.class);
+        if (tabletInputManager != null && !tabletDeviceListenerRegistered) {
+            tabletInputManager.registerInputDeviceListener(tabletDeviceListener, lifecycleHandler);
+            tabletDeviceListenerRegistered = true;
+        }
+
+        applyOrientation();
 
         requestMediaAudioFocus();
 
@@ -1505,38 +1992,43 @@ public class MainActivity extends Activity
 
         // If the user edited the layout JSON in Settings, rebuild the bar so the
         // change takes effect on return to the desktop.
-        String layoutJson = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getString(KEY_EXTRA_KEYS_LAYOUT, "");
-        if (!layoutJson.equals(mAppliedLayoutJson))
-            rebuildExtraKeysBar();
 
         // Pick up a Keyboard-floating toggle made in Settings: update the bar's
         // backdrop and re-run the layout so the surface margin tracks the new mode.
         mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .getBoolean(KEY_KEYBOARD_FLOATING, true);
-        if (extraKeysBar != null)
-            extraKeysBar.setFloating(mKeyboardFloating);
+        refreshHudOverlay();
+        if (virtualKeyboardView != null) {
+            virtualKeyboardView.refreshKeyboardPreferences();
+            if (virtualKeyboardView.getVisibility() == View.VISIBLE)
+                virtualKeyboardView.post(this::positionVirtualKeyboard);
+        }
         relayout();
-
-        // Sync extra-keys bar visibility with the settings switches. With auto-show
-        // ON the bar tracks the keyboard (hidden now if the IME isn't up); with it
-        // OFF the master switch decides. See shouldShowBar.
-        setExtraKeysBarVisible(shouldShowBar(systemIme.isImeVisible()));
 
         setupFullscreen();
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.registerDisplayListener(displayListener, null);
         updateDisplayRotation();
+        if (hdrEnabled && !supportsHdr10())
+            onDisplayError(1);
         // Bring the camera service up (or confirm it disabled) BEFORE nativeStart, so
         // the render thread's do_connect() sees a settled camera_service_is_ready()
         // and registers SERVICE_TYPE_CAMERA on the very first connect rather than a
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
         if (surfaceReady) {
-            mNative.stop();
-            applyConnectionConfig();
-            startNative(surfaceView.getHolder().getSurface());
+            int width = surfaceView.getWidth();
+            int height = surfaceView.getHeight();
+            if (width > 0 && height > 0) {
+                viewWidth = width;
+                viewHeight = height;
+                mNative.setScreenSize(width, height);
+            }
+            if (connectedW != viewWidth || connectedH != viewHeight) {
+                cancelPendingReconnect();
+                reconnectNow(surfaceView.getHolder().getSurface());
+            }
             pushRefreshRate();
             applyMicState();
             applyAudioLatency();
@@ -1558,34 +2050,92 @@ public class MainActivity extends Activity
         autoStretch = prefs.getBoolean(KEY_AUTO_STRETCH, true);
         relayout();
 
+        // Warm the occupancy cache off the critical path, so the immersive
+        // toggle never has to wait on an su round trip to know what Gold holds.
+        if (immersive != null) {
+            immersive.refreshGoldStatus();
+            armAutomaticImmersiveEntry();
+        }
+
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
     }
 
     @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean(KEY_EXPERIMENTAL_HDR, hdrEnabled);
+        super.onSaveInstanceState(outState);
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
+        Log.i(TAG, "onPause: releasing immersive input");
+        mResumed = false;
+        automaticImmersive.cancel();
+        lifecycleHandler.removeCallbacks(automaticImmersiveEntry);
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
+        if (tabletInputManager != null && tabletDeviceListenerRegistered) {
+            tabletInputManager.unregisterInputDeviceListener(tabletDeviceListener);
+            tabletDeviceListenerRegistered = false;
+        }
+        lifecycleHandler.removeCallbacks(delayedFocusStop);
+        lifecycleHandler.removeCallbacks(delayedSurfaceStop);
         // Socket-missing bounce: no pipeline exists, so skip teardown (mNative is
         // null) and don't let the jump to Settings trigger any of it.
         if (mForceSettings) return;
         // A session must never outlive the foreground: leaving the input devices
         // grabbed for a window the user has left is how a tablet gets bricked.
         if (immersive != null) immersive.stop();
+        OplusRefreshRateLease.release(this);
+        // Before the pipeline stops: a key this window forwarded and never saw
+        // released has to be lifted, or the desktop holds it until the user
+        // presses that key again.
+        releaseAllForwardedKeys();
+        releaseScreenTouches();
         clearPointerCaptureBackTracking();
         releasePointerCapture(false);
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (mForceSettings) return;
+        // IMEs can pause the activity while remaining visible. Keep the display
+        // pipeline alive until the whole window leaves the screen.
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
-        mNative.stop();
+        stopNativePipeline();
         abandonMediaAudioFocus();
     }
 
     @Override
     protected void onDestroy() {
+        Log.i(TAG, "onDestroy: releasing native and immersive input");
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .unregisterOnSharedPreferenceChangeListener(hdrBrightnessListener);
+        cancelPendingReconnect();
+        lifecycleHandler.removeCallbacks(delayedFocusStop);
+        lifecycleHandler.removeCallbacks(delayedSurfaceStop);
+        mResumed = false;
+        automaticImmersive.cancel();
+        lifecycleHandler.removeCallbacks(automaticImmersiveEntry);
         abandonMediaAudioFocus();
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
+        if (tabletInputManager != null && tabletDeviceListenerRegistered) {
+            tabletInputManager.unregisterInputDeviceListener(tabletDeviceListener);
+            tabletDeviceListenerRegistered = false;
+        }
         if (immersive != null) immersive.stop();
+        OplusRefreshRateLease.release(this);
+        // Before the pipeline stops: a key this window forwarded and never saw
+        // released has to be lifted, or the desktop holds it until the user
+        // presses that key again.
+        releaseAllForwardedKeys();
+        releaseScreenTouches();
         releasePointerCapture(false);
         if (mRegisteredSocket != null) {
             sWindowsBySocket.remove(mRegisteredSocket, this);
@@ -1694,38 +2244,73 @@ public class MainActivity extends Activity
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i(TAG, "surfaceChanged: " + width + "x" + height);
+        lifecycleHandler.removeCallbacks(delayedSurfaceStop);
         viewWidth = width;
         viewHeight = height;
+        if (width > 0 && height > 0)
+            mNative.setScreenSize(width, height);
         updateDisplayRotation();
         ensurePointerPosition();
         surfaceReady = true;
-        // Same ordering guarantee as onResume: camera service settled before connect.
-        applyCameraState();
-        mNative.stop();
-        applyConnectionConfig();
-        startNative(holder.getSurface());
-        pushRefreshRate();
-        applyMicState();
-        applyAudioLatency();
-        applyAudioKeepalive();
+        scheduleReconnect(holder);
+        scheduleAutomaticImmersiveEntry();
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         updateTouchpadBounds(null);
-        if (mRoot != null)
+        if (mRoot != null) {
             mRoot.post(this::syncPointerCapture);
+            mRoot.postDelayed(this::syncScreenSizeToSurface, 500L);
+        }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        Log.i(TAG, "surfaceDestroyed: delaying immersive teardown");
         surfaceReady = false;
-        if (immersive != null) immersive.stop();
+        if (mResumed && immersive != null) {
+            lifecycleHandler.removeCallbacks(delayedSurfaceStop);
+            lifecycleHandler.postDelayed(delayedSurfaceStop, SURFACE_STOP_DELAY_MS);
+        } else {
+            if (immersive != null) immersive.stop();
+            OplusRefreshRateLease.release(this);
+            releaseAllForwardedKeys();
+            releaseScreenTouches();
+        }
         releasePointerCapture(false);
-        mNative.stop();
+        stopNativePipeline();
     }
 
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        updateDisplayRotation();
+        if (hdrEnabled && !supportsHdr10())
+            onDisplayError(1);
+        if (mRoot != null) {
+            mRoot.post(() -> {
+                WindowInsets insets = mRoot.getRootWindowInsets();
+                if (insets != null)
+                    applyImeInset(insets);
+                else
+                    relayout();
+                updateTouchpadBounds(null);
+                if (mHudOverlay != null)
+                    mHudOverlay.rebuildActiveLayout();
+                if (virtualKeyboardView != null)
+                    virtualKeyboardView.updateScreenSize();
+                if (virtualKeyboardView != null
+                        && virtualKeyboardView.getVisibility() == View.VISIBLE) {
+                    positionVirtualKeyboard();
+                }
+            });
+            mRoot.postDelayed(this::syncScreenSizeToSurface, 400L);
+        } else {
+            relayout();
+        }
+    }
 
-    // Shrink the surface to the area above the keyboard (and the extra-keys bar,
-    // if shown) by giving it a bottom margin. The size change flows through
+    // Shrink the surface to the area above the soft keyboard by giving it a
+    // bottom margin. The size change flows through
     // surfaceChanged -> nativeStart and the producer's resize path, so the
     // focused window relayouts into the upper region instead of hiding behind
     // the keyboard. Reset when the IME goes away.
@@ -1741,41 +2326,51 @@ public class MainActivity extends Activity
         // the flag stays under the toggle's control.
         if (systemIme != null && imeVisible != wasImeVisible)
             systemIme.markImeVisible(imeVisible);
+        // The HUD is a floating layer: it deliberately does NOT follow the IME,
+        // so its controls stay where the user placed them.
+        if (mHudOverlay != null) {
+            mHudOverlay.applySystemInsets(insets);
+        }
     
-        // Only "with_keyboard" mode tracks the IME; "always"/"never"
-        // let the user's manual toggle (back key) stay untouched.
-        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getString(KEY_EXTRA_KEYS_MODE, "always");
-        if (imeVisible != wasImeVisible && "with_keyboard".equals(mode))
-            setExtraKeysBarVisible(imeVisible);
-
         relayout();
     }
 
-    // Desired extra-keys bar visibility for the current keyboard state. The
-    // single three-way preference replaces the old two-switch pair:
-    //   "always"       – bar always visible
-    //   "never"        – bar always hidden
-    //   "with_keyboard" – bar tracks the soft keyboard (default)
-    private boolean shouldShowBar(boolean imeVisible) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        String mode = prefs.getString(KEY_EXTRA_KEYS_MODE, "always");
-        switch (mode) {
-            case "always":   return true;
-            case "never":    return false;
-            default:         return imeVisible;
-        }
+    private void refreshHudOverlay() {
+        if (mHudOverlay == null) return;
+        mHudOverlay.loadProfile();
+        mHudOverlay.rebuildActiveLayout();
+        applyHudVisibility();
     }
 
-    // Recompute the surface bottom margin and the bar position from the current
-    // IME inset and bar visibility. The surface ends above the bar, which sits
-    // directly on top of the IME: "surface / extra-keys bar / IME" bottom-up.
+    /**
+     * The floating keyboard gets its own HUD layer instead of burying the main
+     * one: while the keyboard is up the overlay switches to the keyboard layout,
+     * which holds whatever the user put next to the keys (modifiers, arrows, …)
+     * and is empty until they add something.
+     */
+    private void applyHudVisibility() {
+        if (mHudOverlay == null) return;
+        boolean keyboardUp = virtualKeyboardView != null
+                && virtualKeyboardView.getVisibility() == View.VISIBLE;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean wantHud = prefs.getBoolean(KEY_USE_HUD_OVERLAY, true);
+        mHudOverlay.setLayer(keyboardUp
+                ? com.anland.consumer.hud.HudOverlayView.LAYER_KEYBOARD
+                : com.anland.consumer.hud.HudOverlayView.LAYER_HUD);
+        int next = wantHud ? View.VISIBLE : View.GONE;
+        if (next == View.GONE && mHudOverlay.getVisibility() != View.GONE) {
+            // A widget hidden under the finger never sees its ACTION_UP, so the
+            // gesture has to be cancelled here instead of ending in limbo.
+            cancelOverlayTouches();
+        }
+        mHudOverlay.setVisibility(next);
+    }
+
+    // Recompute the surface bottom margin from the current IME inset.
+    // Floating mode: the soft keyboard overlays the display, so the surface
+    // keeps its full size (target 0). Default mode: shrink it above the IME.
     private void relayout() {
-        boolean barVisible = extraKeysBar != null && extraKeysBar.getVisibility() == View.VISIBLE;
-        int barH = barVisible ? mBarHeight : 0;
-        // Floating mode: keyboard + bar overlay the display, so the surface keeps
-        // its full size (target 0). Default mode: shrink the surface above both.
-        int target = mKeyboardFloating ? 0 : (mImeBottom + barH);
+        int target = mKeyboardFloating ? 0 : mImeBottom;
 
         FrameLayout.LayoutParams lp =
             (FrameLayout.LayoutParams) surfaceView.getLayoutParams();
@@ -1795,8 +2390,6 @@ public class MainActivity extends Activity
             adjustSurfaceViewLayout(lp);
         }
         
-        if (extraKeysBar != null)
-            extraKeysBar.setTranslationY(-mImeBottom);
     }
     
     private void adjustSurfaceViewLayout(FrameLayout.LayoutParams lp) {
@@ -1843,79 +2436,23 @@ public class MainActivity extends Activity
         surfaceScale = (float) surfaceW / customScreenWidth;
     }
 
-    // Show/hide the extra-keys bar and re-apply the layout so the display area
-    // is compressed (shown) or restored (hidden).
-    private void setExtraKeysBarVisible(boolean visible) {
-        if (extraKeysBar == null) return;
-        boolean cur = extraKeysBar.getVisibility() == View.VISIBLE;
-        if (cur == visible) return;
-        extraKeysBar.setVisibility(visible ? View.VISIBLE : View.GONE);
-        if (!visible) extraKeysBar.reset();
-        relayout();
-    }
-
-    // Construct the extra-keys bar from the user's saved JSON layout and add it to
-    // the content root (hidden). The bar height mirrors Termux at 37.5dp/row and
-    // scales with the parsed row count. Records the layout JSON it was built from.
-    private void buildExtraKeysBar() {
-        extraKeysBar = new ExtraKeysBar(this, new ExtraKeysBar.Sender() {
-            @Override public void key(int action, int evdev) { mNative.sendKey(action, evdev); }
-            @Override public void text(String s) {
-                if (!s.isEmpty()) mNative.sendTextInput(s.getBytes(StandardCharsets.UTF_8));
-            }
-            // Tapping the ⌨ key keeps the original behaviour: toggle the system IME.
-            @Override public void toggleKeyboard() { systemIme.toggleSystemKeyboard(); }
-            // Pulling up on the ⌨ key toggles the floating virtual keyboard.
-            @Override public void toggleVirtualKeyboard() {
-                if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
-                    virtualKeyboardView.setVisibility(View.GONE);
-                } else {
-                    Log.d("VirtualKeyboard", "toggle: showing keyboard, mRoot="
-                            + mRoot.getWidth() + "x" + mRoot.getHeight());
-                    virtualKeyboardView.setVisibility(View.VISIBLE);
-                    virtualKeyboardView.bringToFront();
-                    // Re-position it (in case screen size changed)
-                    positionVirtualKeyboard();
-                    // Hide the system IME to avoid overlap with the floating keyboard.
-                    InputMethodManager imm = getSystemService(InputMethodManager.class);
-                    if (imm != null && getCurrentFocus() != null) {
-                        imm.hideSoftInputFromWindow(getCurrentFocus().getWindowToken(), 0);
-                    }
-                }
-            }
-            @Override public void openSettings() {
-                startActivity(new Intent(MainActivity.this, SettingsActivity.class));
-            }
-        });
-        mBarHeight = Math.round(37.5f * mDensity * extraKeysBar.getRowCount());
-        extraKeysBar.setFloating(mKeyboardFloating);
-        extraKeysBar.setVisibility(View.GONE);
-        mRoot.addView(extraKeysBar, new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, mBarHeight, Gravity.BOTTOM));
-        mAppliedLayoutJson = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getString(KEY_EXTRA_KEYS_LAYOUT, "");
-    }
-
-    // Replace the bar with a freshly-parsed one after the user edits the layout in
-    // Settings. Called from onResume when the saved JSON no longer matches what the
-    // current bar was built from.
-    private void rebuildExtraKeysBar() {
-        if (mRoot == null) return;
-        if (extraKeysBar != null) {
-            extraKeysBar.reset();
-            mRoot.removeView(extraKeysBar);
+    private void toggleVirtualKeyboard() {
+        if (virtualKeyboardView == null) return;
+        if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
+            virtualKeyboardView.hideWithAnimation(null);
+            return;
         }
-        buildExtraKeysBar();
-        setExtraKeysBarVisible(shouldShowBar(systemIme.isImeVisible()));
-        relayout();
-    }
 
-    // Toggle the extra-keys bar on its own (e.g. from the Back key), independent of
-    // the soft keyboard. Showing it just compresses the display area above the bar.
-    private void toggleExtraKeysBar() {
-        boolean visible = extraKeysBar != null
-            && extraKeysBar.getVisibility() == View.VISIBLE;
-        setExtraKeysBarVisible(!visible);
+        virtualKeyboardView.updateScreenSize();
+        virtualKeyboardView.bringToFront();
+        positionVirtualKeyboard();
+        virtualKeyboardView.showWithAnimation();
+        applyHudVisibility();
+
+        InputMethodManager imm = getSystemService(InputMethodManager.class);
+        if (imm != null && getCurrentFocus() != null) {
+            imm.hideSoftInputFromWindow(getCurrentFocus().getWindowToken(), 0);
+        }
     }
 
     /**
@@ -1925,8 +2462,8 @@ public class MainActivity extends Activity
      */
     private boolean handleSoftKeyboardToggleKey(KeyEvent event) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        // self-use 个性化：默认将 BACK 键绑定为系统输入法切换键（与 extra-keys bar 互斥，
-        // 此处先于 KEY_BACK_OPENS_EXTRA_KEYS 拦截）。用户可在设置中改为 -1 以解除绑定。
+        // self-use 个性化：默认将 BACK 键绑定为系统输入法切换键。
+        // 用户可在设置中改为 -1 以解除绑定。
         int boundKeycode = prefs.getInt(KEY_BOUND_KEYCODE, KeyEvent.KEYCODE_BACK);
         if (boundKeycode == -1 || event.getKeyCode() != boundKeycode)
             return false;
@@ -1941,8 +2478,8 @@ public class MainActivity extends Activity
 
     // Apply the screen-orientation preference (default / landscape / portrait).
     private void applyOrientation() {
-        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getString("screen_orientation", "default");
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        String mode = prefs.getString("screen_orientation", "default");
         switch (mode) {
             case "landscape":
                 setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
@@ -1959,18 +2496,14 @@ public class MainActivity extends Activity
     // ---- SystemIME.Host ----
 
     @Override
-    public ExtraKeysBar getExtraKeysBar() {
-        return extraKeysBar;
+    public com.anland.consumer.hud.IModifierProvider getModifierProvider() {
+        return mHudOverlay;
     }
 
     // The IME was shown/hidden via SystemIME's toggle. In freeform mode the inset
-    // callback may not fire, so sync the extra-keys bar explicitly here in all modes.
+    // callback may not fire, so re-focus the surface here.
     @Override
     public void onImeVisibilityChanged(boolean visible) {
-        String mode = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getString(KEY_EXTRA_KEYS_MODE, "always");
-        if ("with_keyboard".equals(mode))
-            setExtraKeysBarVisible(visible);
         if (!visible && surfaceView != null) {
             surfaceView.requestFocus();
             if (mRoot != null)
@@ -2033,12 +2566,263 @@ public class MainActivity extends Activity
     public void onGrabbedTouch(MotionEvent ev) {
         if (mNative == null)
             return;
-        if (isTouchpadMode) {
-            updateTouchpadBounds(null);
-            screenTouchpad.onTouch(ev);
-        } else {
-            handleTouchEvent(ev);
+        routeGrabbedTouch(ev);
+    }
+
+    private int rawTabletDeviceId(int helperDevice) {
+        // Android InputDevice ids are nonnegative. Allocate a new high-bit id
+        // when the helper reuses a slot for a hotplugged physical device.
+        if (helperDevice < 0 || helperDevice >= rawTabletDeviceIds.length)
+            return 0x80000000 | (helperDevice & 0x7fffffff);
+        if (rawTabletDeviceIds[helperDevice] == 0) {
+            if (nextRawTabletDeviceId <= 0)
+                return 0;
+            rawTabletDeviceIds[helperDevice] = 0x80000000 | nextRawTabletDeviceId++;
         }
+        return rawTabletDeviceIds[helperDevice];
+    }
+
+    @Override
+    public void onEvdevTabletSample(int helperDevice, EvdevTabletState.Sample sample,
+                                   float viewX, float viewY) {
+        if (mNative == null || sample == null)
+            return;
+        float[] nativeCoords = convertToNativeCoords(viewX, viewY);
+        tabletInput.update(new TabletInput.Sample(rawTabletDeviceId(helperDevice),
+                sample.pointerId, sample.toolType, sample.capabilities,
+                nativeCoords[0], nativeCoords[1], sample.pressure,
+                sample.tiltX, sample.tiltY, sample.distance,
+                sample.proximity, sample.tipDown, sample.tipState, false,
+                sample.buttons, sample.timeMsec));
+    }
+
+    @Override
+    public void cancelEvdevTabletDevice(int helperDevice, long timeMsec) {
+        if (helperDevice < 0 || helperDevice >= rawTabletDeviceIds.length)
+            return;
+        int deviceId = rawTabletDeviceIds[helperDevice];
+        if (deviceId != 0)
+            tabletInput.cancelDevice(deviceId, timeMsec);
+        rawTabletDeviceIds[helperDevice] = 0;
+    }
+
+    @Override
+    public void cancelEvdevTabletTools(long timeMsec) {
+        for (int deviceId : rawTabletDeviceIds) {
+            if (deviceId != 0)
+                tabletInput.cancelDevice(deviceId, timeMsec);
+        }
+    }
+
+    private void resetTabletIdentitySession() {
+        tabletInput.resetSession();
+        Arrays.fill(rawTabletDeviceIds, 0);
+        nextRawTabletDeviceId = 1;
+    }
+
+    /**
+     * Hands a grabbed touch frame to whoever owns each of its pointers.
+     *
+     * Immersive mode takes the panel away from Android with EVIOCGRAB, so these
+     * frames never travel through the window: without this the HUD and the
+     * floating keyboard would be dead for the whole session. Ownership is
+     * decided per pointer, where it first touches down — a thumb resting on a
+     * HUD key must not stop the other thumb from dragging the desktop, and the
+     * desktop stream must not be left open when a key is pressed mid-drag.
+     */
+    private void routeGrabbedTouch(MotionEvent ev) {
+        handleTabletMotionEvent(ev);
+        if (!immersiveHudTouch) {
+            // Setting off: the grabbed stream belongs to the desktop alone,
+            // exactly like it did before the HUD could be reached here.
+            grabbedOverlayPointers.clear();
+            if (isTouchpadMode) {
+                updateTouchpadBounds(null);
+                dispatchTouchpadWithoutTablet(ev);
+            } else {
+                handleTouchEvent(ev);
+            }
+            return;
+        }
+        final int action = ev.getActionMasked();
+        final int index = ev.getActionIndex();
+        final int pointerId = ev.getPointerId(index);
+        final boolean isDown = action == MotionEvent.ACTION_DOWN
+                || action == MotionEvent.ACTION_POINTER_DOWN;
+
+        if (isDown) {
+            if (!isTabletTool(ev.getToolType(index))
+                    && isOverlayControlAt(ev.getX(index), ev.getY(index)))
+                grabbedOverlayPointers.add(pointerId);
+            else
+                grabbedOverlayPointers.remove(pointerId);
+        }
+
+        if (anyOverlayPointer(ev)) {
+            MotionEvent overlay = anyDesktopPointer(ev) ? splitGrabbedEvent(ev, true) : ev;
+            boolean handled = false;
+            if (overlay != null) {
+                try {
+                    handled = mRoot != null && mRoot.dispatchTouchEvent(overlay);
+                } finally {
+                    if (overlay != ev) overlay.recycle();
+                }
+            }
+            if (!handled && isDown) {
+                // The control went away between the hit test and the dispatch
+                // (layout rebuilt, keyboard dismissed, ...). Give the pointer
+                // back to the desktop instead of swallowing it.
+                grabbedOverlayPointers.remove(pointerId);
+            }
+        }
+
+        if (anyDesktopPointer(ev)) {
+            MotionEvent desktop = anyOverlayPointer(ev) ? splitGrabbedEvent(ev, false) : ev;
+            if (desktop != null) {
+                try {
+                    if (isTouchpadMode) {
+                        updateTouchpadBounds(null);
+                        dispatchTouchpadWithoutTablet(desktop);
+                    } else {
+                        handleTouchEvent(desktop);
+                    }
+                } finally {
+                    if (desktop != ev) desktop.recycle();
+                }
+            }
+        }
+
+        if (action == MotionEvent.ACTION_CANCEL)
+            grabbedOverlayPointers.clear();   // every pointer of the stream died
+        else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+            grabbedOverlayPointers.remove(pointerId);
+    }
+
+    private boolean anyOverlayPointer(MotionEvent ev) {
+        for (int i = 0; i < ev.getPointerCount(); i++)
+            if (grabbedOverlayPointers.contains(ev.getPointerId(i))) return true;
+        return false;
+    }
+
+    private boolean anyDesktopPointer(MotionEvent ev) {
+        for (int i = 0; i < ev.getPointerCount(); i++)
+            if (!grabbedOverlayPointers.contains(ev.getPointerId(i))) return true;
+        return false;
+    }
+
+    /**
+     * True when a HUD control (or the floating keyboard) would take a touch at
+     * this window-space point. Coordinates already are view pixels, the same
+     * space the overlay lays its widgets out in.
+     */
+    private boolean isOverlayControlAt(float x, float y) {
+        if (mHudOverlay != null && mHudOverlay.isControlAt(x, y)) return true;
+        View kb = virtualKeyboardView;
+        return kb != null && kb.getVisibility() == View.VISIBLE
+                && x >= kb.getX() && y >= kb.getY()
+                && x < kb.getX() + kb.getWidth() && y < kb.getY() + kb.getHeight();
+    }
+
+    /**
+     * Copies the pointers that belong to one side of the split into a new
+     * event, rewriting the action so each side sees a well-formed stream
+     * (DOWN for its first pointer, POINTER_DOWN / POINTER_UP afterwards, MOVE
+     * for the frames that merely pass by).
+     */
+    private MotionEvent splitGrabbedEvent(MotionEvent src, boolean overlay) {
+        final int count = src.getPointerCount();
+        final int[] keep = new int[count];
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            if (grabbedOverlayPointers.contains(src.getPointerId(i)) == overlay)
+                keep[n++] = i;
+        }
+        if (n == 0) return null;
+
+        final int masked = src.getActionMasked();
+        final int srcIndex = src.getActionIndex();
+        int newIndex = -1;
+        for (int k = 0; k < n; k++) {
+            if (keep[k] == srcIndex) { newIndex = k; break; }
+        }
+
+        int outAction;
+        switch (masked) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                outAction = newIndex < 0 ? MotionEvent.ACTION_MOVE
+                        : newIndex == 0 && n == 1 ? MotionEvent.ACTION_DOWN
+                        : MotionEvent.ACTION_POINTER_DOWN
+                                | (newIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+                outAction = newIndex < 0 ? MotionEvent.ACTION_MOVE
+                        : n == 1 ? MotionEvent.ACTION_UP
+                        : MotionEvent.ACTION_POINTER_UP
+                                | (newIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                break;
+            case MotionEvent.ACTION_MOVE:
+                outAction = MotionEvent.ACTION_MOVE;
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                outAction = MotionEvent.ACTION_CANCEL;
+                break;
+            default:
+                return null;
+        }
+
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[n];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[n];
+        for (int k = 0; k < n; k++) {
+            props[k] = new MotionEvent.PointerProperties();
+            src.getPointerProperties(keep[k], props[k]);
+            coords[k] = new MotionEvent.PointerCoords();
+            src.getPointerCoords(keep[k], coords[k]);
+        }
+        return MotionEvent.obtain(src.getDownTime(), src.getEventTime(), outAction, n,
+                props, coords, src.getMetaState(), src.getButtonState(),
+                src.getXPrecision(), src.getYPrecision(), src.getDeviceId(),
+                src.getEdgeFlags(), src.getSource(), src.getFlags());
+    }
+
+    /**
+     * Drops any HUD / keyboard gesture that was in flight when the immersive
+     * session ended. Without this the widget that was held would never see an
+     * ACTION_UP and would keep its modifier latched.
+     */
+    private void cancelOverlayTouches() {
+        grabbedOverlayPointers.clear();
+        if (mRoot == null)
+            return;
+        long now = SystemClock.uptimeMillis();
+        MotionEvent cancel = MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL,
+                0f, 0f, 0);
+        try {
+            mRoot.dispatchTouchEvent(cancel);
+        } finally {
+            cancel.recycle();
+        }
+    }
+
+    @Override
+    public void onTouchscreenGrabChanged(boolean grabbed) {
+        if (touchscreenGrabbed == grabbed)
+            return;
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
+        // The Android contact ids and the helper's slots belong to different
+        // streams. End the old stream before accepting any of the new one.
+        releaseScreenTouches();
+        touchscreenGrabbed = grabbed;
+    }
+
+    private void releaseScreenTouches() {
+        // The grab flapped: both streams start over, so no pointer id from the
+        // previous one may keep a HUD control latched.
+        cancelOverlayTouches();
+        forwardedTouches.releaseAll();
+        if (screenTouchpad != null)
+            screenTouchpad.cancel();
     }
 
     /**
@@ -2056,10 +2840,14 @@ public class MainActivity extends Activity
     }
 
     @Override
-    public void movePointerRelative(float dx, float dy) {
-        // Same acceleration curve as a captured pad, so the sensitivity slider
-        // under Touchpad & Mouse means the same thing in an immersive session.
-        sendCapturedTouchpadMotion(dx, dy);
+    public void movePointerRelative(float dx, float dy, float speedCountsPerSecond) {
+        if (dx == 0f && dy == 0f)
+            return;
+        // The speed comes from the device's timestamps, never main-thread timing.
+        float speed = speedCountsPerSecond / RELATIVE_ACCEL_REFERENCE_COUNTS_PER_S;
+        float scale = 1.0f + (capturedTouchpadAccel - 1.0f) * (speed / (1.0f + speed));
+        scale = Math.max(0.3f, Math.min(10.0f, scale));
+        movePointerBy(dx * scale, dy * scale);
     }
 
     @Override
@@ -2082,57 +2870,42 @@ public class MainActivity extends Activity
 
     @Override
     public void onImmersiveChanged(boolean active) {
+        tabletInput.cancelAll(SystemClock.uptimeMillis());
         immersiveActive = active;
+        // This is the one place both sources report a session starting or
+        // ending, so it is where Gold is told to switch profiles and back.
+        if (immersive != null)
+            immersive.onSessionActiveChanged(active);
         if (active) {
+            // A manual start consumes a pending automatic attempt too. Its exit
+            // must not be undone by an availability retry already on the queue.
+            automaticImmersive.cancel();
+            lifecycleHandler.removeCallbacks(automaticImmersiveEntry);
+            immersiveHudTouch = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(ImmersiveMode.KEY_HUD_TOUCH, ImmersiveMode.DEFAULT_HUD_TOUCH);
             // The pointer is grabbed at the evdev level for the whole session, so
             // Android's capture is dropped for its duration. The user's "capture
             // external pointer" setting is left alone and takes effect again as
             // soon as the session ends.
             releasePointerCapture(false);
-            pinDisplayRefreshRate(true);
+            if (mResumed && hasWindowFocus() && isOplusRefreshRateLockEnabled())
+                OplusRefreshRateLease.acquire(this);
+            else
+                OplusRefreshRateLease.release(this);
         } else {
-            pinDisplayRefreshRate(false);
+            OplusRefreshRateLease.release(this);
+            // A control held through the grabbed stream will never get its
+            // ACTION_UP once Android owns the panel again.
+            cancelOverlayTouches();
             if (mRoot != null)
                 mRoot.post(this::syncPointerCapture);
         }
     }
 
-    /**
-     * While an immersive session runs, the desktop is the only thing on screen.
-     * Panels with power-saving mode switching drop to 30-60 Hz when the image
-     * goes still, which reads as a sudden refresh-rate drop and stutter the
-     * moment the user stops moving the pointer; a touch on the panel would have
-     * kept it boosted before. Pin the display to a high rate for the duration
-     * (KWin follows the resulting mode switch through pushRefreshRate).
-     */
-    private void pinDisplayRefreshRate(boolean pin) {
-        try {
-            Surface s = surfaceView.getHolder().getSurface();
-            if (s == null || !s.isValid())
-                return;
-            if (!pin) {
-                s.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
-                        Surface.CHANGE_FRAME_RATE_ALWAYS);
-                return;
-            }
-            Display d = getDisplay();
-            if (d == null)
-                return;
-            float hz = d.getRefreshRate();
-            if (hz < 90f) {
-                // Entered mid-drop: go for the panel's best instead of pinning
-                // whatever low rate it has fallen to.
-                for (float r : d.getSupportedRefreshRates()) {
-                    if (r > hz)
-                        hz = r;
-                }
-            }
-            s.setFrameRate(hz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
-                    Surface.CHANGE_FRAME_RATE_ALWAYS);
-            Log.i(TAG, "immersive: display pinned at " + hz + " Hz");
-        } catch (Exception e) {
-            Log.w(TAG, "setFrameRate failed: " + e);
-        }
+    private boolean isOplusRefreshRateLockEnabled() {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(OplusRefreshRateLease.KEY_ENABLED,
+                        OplusRefreshRateLease.DEFAULT_ENABLED);
     }
 
     // ================================================================
@@ -2140,6 +2913,9 @@ public class MainActivity extends Activity
     // ================================================================
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (touchscreenGrabbed && event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN))
+            return true; // Android may still dispatch the tail queued before EVIOCGRAB.
+        handleTabletMotionEvent(event);
         boolean mouseEvent = isMouseEvent(event);
         if (mouseEvent && event.getActionMasked() == MotionEvent.ACTION_DOWN
                 && pointerCaptureWanted() && mRoot != null
@@ -2154,7 +2930,7 @@ public class MainActivity extends Activity
             // Bounds are refreshed here as well as in surfaceChanged: the IME inset
             // resizes the surface without going through it on every path.
             updateTouchpadBounds(null);
-            screenTouchpad.onTouch(event);
+            dispatchTouchpadWithoutTablet(event);
             return true;
         }
 
@@ -2171,6 +2947,10 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
+        if (containsTabletPointer(event)) {
+            handleTabletMotionEvent(event);
+            return true;
+        }
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_BUTTON_PRESS
@@ -2218,32 +2998,47 @@ public class MainActivity extends Activity
         return super.onGenericMotionEvent(event);
     }
 
-    @Override
-    public boolean onKeyDown(int keyCode, KeyEvent event) {
+    /**
+     * The source-aware part of every key decision, in the one order all three
+     * ingresses must use. Keeping it in one place is what makes the Activity and
+     * the accessibility service behave identically — with interception on, the
+     * service eats keys before the window ever sees them.
+     *
+     * @return true when the event was consumed
+     */
+    private boolean handleSourceAwareKey(KeyEvent event) {
         // First: the immersive toggle is the way out of a session that has taken
         // every input device, so nothing else may consume it.
         if (immersive != null && immersive.handleKey(event))
             return true;
+        InputDevice controller = event.getDevice();
+        if (immersive != null && immersive.usesDirectControllers() && controller != null
+                && (controller.supportsSource(InputDevice.SOURCE_GAMEPAD)
+                    || controller.supportsSource(InputDevice.SOURCE_JOYSTICK)))
+            return true; // Desktop reads evdev; queued Android buttons must not become keys.
         if (handlePointerCaptureBackKey(event))
             return true;
         // Mouse Back is already forwarded as BTN_SIDE from the MotionEvent path.
-        // Swallow Android's duplicate KEYCODE_BACK so it neither releases capture
-        // nor toggles the extra-keys bar.
-        if (keyCode == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))
+        // Swallow Android's duplicate KEYCODE_BACK so it does not release capture.
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))
             return true;
         if (handleSoftKeyboardToggleKey(event))
             return true;
+        // Discard Android events queued just before the helper's exclusive grab.
+        return immersive != null && immersive.ownsGoldKeyboard()
+                && GoldKeyboard.matches(event.getDevice());
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (handleSourceAwareKey(event))
+            return true;
+        // Before the repeat swallow: each repeat must become one more tap, so
+        // held-key auto-repeat still works (see handleImeDelTap).
+        if (handleImeDelTap(event))
+            return true;
         if (event.getRepeatCount() > 0)
             return true;
-
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        // Back key toggles the extra-keys bar (without opening the soft keyboard)
-        // when enabled in settings. Leaves the default swallow behaviour otherwise.
-        if (keyCode == KeyEvent.KEYCODE_BACK
-                && prefs.getBoolean(KEY_BACK_OPENS_EXTRA_KEYS, true)) {
-            toggleExtraKeysBar();
-            return true;
-        }
 
         forwardKeyToLinux(event);
         return true;
@@ -2255,6 +3050,10 @@ public class MainActivity extends Activity
     // unexpectedly finish via gesture navigation.
     @Override
     public void onBackPressed() {
+        if (mHudOverlay != null && mHudOverlay.isEditMode()) {
+            mHudOverlay.requestExit();
+            return;
+        }
         if (mRoot != null && mRoot.hasPointerCapture()) {
             releasePointerCapture(true);
             // There is no KeyEvent on this OEM path. Use a wildcard so a trailing
@@ -2268,65 +3067,94 @@ public class MainActivity extends Activity
     // Called from KeyInterceptor (accessibility service) to handle keys that
     // the normal onKeyDown/onKeyUp might miss (e.g. Fn combos).
     public boolean handleAccessibilityKey(KeyEvent event) {
-        // With interception on, KeyInterceptor consumes keys before the window
-        // ever sees them, so the immersive toggle has to be recognised here too —
-        // the two features are wanted by exactly the same users.
-        if (immersive != null && immersive.handleKey(event))
-            return true;
-        if (handlePointerCaptureBackKey(event))
-            return true;
-        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))
-            return true;
-        if (handleSoftKeyboardToggleKey(event))
+        // The same decision boundary as the Activity paths: with interception on
+        // this is the only ingress, and the two must not diverge.
+        if (handleSourceAwareKey(event))
             return true;
         if (event.getRepeatCount() > 0)
             return true;
 
         // Some tablet keyboard layouts expose their physical Esc key as
         // Android Back (Linux KEY_BACK / Browser Back).  Convert it only on
-        // the accessibility-interception path so the normal Android Back and
-        // extra-keys-bar behaviour is unchanged when interception is off.
+        // the accessibility-interception path so the normal Android Back
+        // behaviour is unchanged when interception is off.
         return forwardKeyToLinux(event, true);
+    }
+
+    /**
+     * Backspace while the soft keyboard is open is delivered as an instant
+     * press+release tap: LatinIME acts on the DEL ACTION_UP and consumes it,
+     * so a forwarded press would never see its release — the desktop then
+     * holds the key down and its own key repeat drains the field (Android
+     * apps delete on ACTION_DOWN and never depend on the UP; the desktop
+     * keys off the release instead). Repeats each become one more tap, so
+     * held-key auto-repeat still works.
+     *
+     * <p>Activity paths only: the accessibility interception receives both the
+     * DOWN and the UP itself (the IME never sees the key), so it keeps the
+     * ordinary press/release forwarding.
+     *
+     * @return true when the event was consumed
+     */
+    private boolean handleImeDelTap(KeyEvent event) {
+        if (event.getKeyCode() != KeyEvent.KEYCODE_DEL || !systemIme.isImeWanted())
+            return false;
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            int evdev = KeyResolver.resolveEvdevCode(event.getKeyCode(),
+                    event.getScanCode(), false);
+            if (evdev > 0) {
+                mNative.sendKey(0, evdev);
+                mNative.sendKey(1, evdev);
+            }
+        }
+        return true;   /* UP swallowed — already released with the tap */
     }
 
     private boolean forwardKeyToLinux(KeyEvent event) {
         return forwardKeyToLinux(event, false);
     }
 
-    private boolean forwardKeyToLinux(KeyEvent event, boolean convertBackToEscape) {
-        int keyCode = event.getKeyCode();
-        int action = event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1;
-        int evdev = -1;
+    /**
+     * evdev codes this window forwarded through the ordinary path and has not
+     * released.
+     *
+     * <p>The immersive sessions keep ledgers of their own, and those cover only
+     * their own keys. Nothing covered this path, so a key forwarded here and
+     * still held when the window went away stayed held on the desktop -- until
+     * the user pressed and released that same key again.
+     */
+    private final java.util.LinkedHashSet<Integer> forwardedKeys =
+            new java.util.LinkedHashSet<>();
 
-        if (convertBackToEscape
-                && (keyCode == KeyEvent.KEYCODE_BACK
-                    || event.getScanCode() == EVDEV_BROWSER_BACK))
-            evdev = KeyCodeMapper.getScanCode(KeyEvent.KEYCODE_ESCAPE);
-
-        // Reserved Android keys may carry vendor scan codes that Linux does not
-        // recognize, so prefer their explicit evdev mapping.
-        if (evdev == -1 && shouldPreferMappedKey(keyCode))
-            evdev = KeyCodeMapper.getScanCode(keyCode);
-
-        if (evdev == -1 && event.getScanCode() != 0)
-            evdev = event.getScanCode();
-
-        if (evdev == -1)
-            evdev = KeyCodeMapper.getScanCode(keyCode);
-
-        if (evdev == -1)
-            return false;
-
-        mNative.sendKey(action, evdev);
-        return true;
+    /**
+     * Releases every key this window forwarded and never saw released, in
+     * reverse press order so a modifier is lifted after the key it modified.
+     *
+     * <p>Called everywhere the window stops being the one the user is typing
+     * into, for the same reason the mouse buttons are.
+     */
+    private void releaseAllForwardedKeys() {
+        if (forwardedKeys.isEmpty())
+            return;
+        if (mNative != null) {
+            java.util.List<Integer> held = new java.util.ArrayList<>(forwardedKeys);
+            for (int index = held.size() - 1; index >= 0; index--)
+                mNative.sendKey(1, held.get(index));
+        }
+        forwardedKeys.clear();
     }
 
-    private static boolean shouldPreferMappedKey(int keyCode) {
-        return keyCode == KeyEvent.KEYCODE_META_LEFT
-                || keyCode == KeyEvent.KEYCODE_META_RIGHT
-                || keyCode == KeyEvent.KEYCODE_SEARCH
-                || keyCode == KeyEvent.KEYCODE_ASSIST
-                || (keyCode >= KeyEvent.KEYCODE_F13 && keyCode <= KeyEvent.KEYCODE_F24);
+    private boolean forwardKeyToLinux(KeyEvent event, boolean convertBackToEscape) {
+        int evdev = KeyResolver.resolveEvdevCode(event.getKeyCode(), event.getScanCode(),
+                convertBackToEscape);
+        if (evdev < 0)
+            return false;
+        if (event.getAction() == KeyEvent.ACTION_DOWN)
+            forwardedKeys.add(evdev);
+        else
+            forwardedKeys.remove(evdev);
+        mNative.sendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, evdev);
+        return true;
     }
 
     public boolean isAccessibilityInterceptEnabled() {
@@ -2336,13 +3164,9 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
-        if (immersive != null && immersive.handleKey(event))
+        if (handleSourceAwareKey(event))
             return true;
-        if (handlePointerCaptureBackKey(event))
-            return true;
-        if (keyCode == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))
-            return true;
-        if (handleSoftKeyboardToggleKey(event))
+        if (handleImeDelTap(event))
             return true;
         forwardKeyToLinux(event);
         return true;
@@ -2421,6 +3245,274 @@ public class MainActivity extends Activity
         updateMouseButtonState(bs);
     }
 
+    private static boolean isTabletTool(int toolType) {
+        return toolType == MotionEvent.TOOL_TYPE_STYLUS
+                || toolType == MotionEvent.TOOL_TYPE_ERASER;
+    }
+
+    private static boolean containsTabletPointer(MotionEvent event) {
+        for (int i = 0; i < event.getPointerCount(); i++) {
+            if (isTabletTool(event.getToolType(i)))
+                return true;
+        }
+        return false;
+    }
+
+    /** Convert every pen pointer, including historical samples, without mouse emulation. */
+    private void handleTabletMotionEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        long eventTime = event.getEventTime();
+        if (action == MotionEvent.ACTION_CANCEL) {
+            tabletInput.cancelDevice(event.getDeviceId(), eventTime);
+            return;
+        }
+        if (!containsTabletPointer(event))
+            return;
+
+        int capabilities = tabletCapabilities(event);
+        int buttons = tabletButtons(event);
+        if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE) {
+            for (int history = 0; history < event.getHistorySize(); history++) {
+                long time = event.getHistoricalEventTime(history);
+                for (int pointer = 0; pointer < event.getPointerCount(); pointer++) {
+                    if (isTabletTool(event.getToolType(pointer)))
+                        sendTabletPointerSample(event, pointer, history, capabilities,
+                                buttons, action, time);
+                }
+            }
+        }
+        for (int pointer = 0; pointer < event.getPointerCount(); pointer++) {
+            if (isTabletTool(event.getToolType(pointer)))
+                sendTabletPointerSample(event, pointer, -1, capabilities,
+                        buttons, action, eventTime);
+        }
+    }
+
+    private void dispatchTouchpadWithoutTablet(MotionEvent event) {
+        if (!containsTabletPointer(event) || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            screenTouchpad.onTouch(event);
+            return;
+        }
+        MotionEvent fingers = filterTabletPointers(event, false);
+        if (fingers == null)
+            return;
+        try {
+            screenTouchpad.onTouch(fingers);
+        } finally {
+            fingers.recycle();
+        }
+    }
+
+    /** Makes a well-formed event for one tool class while preserving batched samples. */
+    private MotionEvent filterTabletPointers(MotionEvent source, boolean keepTablet) {
+        int pointerCount = source.getPointerCount();
+        int[] keep = new int[pointerCount];
+        int count = 0;
+        for (int i = 0; i < pointerCount; i++) {
+            if (isTabletTool(source.getToolType(i)) == keepTablet)
+                keep[count++] = i;
+        }
+        if (count == 0)
+            return null;
+
+        int action = source.getActionMasked();
+        int sourceIndex = source.getActionIndex();
+        int newActionIndex = -1;
+        for (int i = 0; i < count; i++) {
+            if (keep[i] == sourceIndex) {
+                newActionIndex = i;
+                break;
+            }
+        }
+
+        int filteredAction;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                filteredAction = newActionIndex < 0 ? MotionEvent.ACTION_MOVE
+                        : newActionIndex == 0 && count == 1 ? MotionEvent.ACTION_DOWN
+                        : MotionEvent.ACTION_POINTER_DOWN
+                                | (newActionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+                filteredAction = newActionIndex < 0 ? MotionEvent.ACTION_MOVE
+                        : count == 1 ? MotionEvent.ACTION_UP
+                        : MotionEvent.ACTION_POINTER_UP
+                                | (newActionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT);
+                break;
+            case MotionEvent.ACTION_MOVE:
+                filteredAction = MotionEvent.ACTION_MOVE;
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                filteredAction = MotionEvent.ACTION_CANCEL;
+                break;
+            case MotionEvent.ACTION_HOVER_ENTER:
+            case MotionEvent.ACTION_HOVER_MOVE:
+            case MotionEvent.ACTION_HOVER_EXIT:
+            case MotionEvent.ACTION_SCROLL:
+                filteredAction = action;
+                break;
+            case MotionEvent.ACTION_BUTTON_PRESS:
+            case MotionEvent.ACTION_BUTTON_RELEASE:
+                // Stylus buttons were already routed through the tablet frame.
+                // Represent their accompanying finger sample as motion so this
+                // filtered event cannot turn the same side button into a mouse
+                // click in a child view or the Activity fallback.
+                int actionButton = source.getActionButton();
+                boolean tabletButton = actionButton == MotionEvent.BUTTON_STYLUS_PRIMARY
+                        || actionButton == MotionEvent.BUTTON_STYLUS_SECONDARY;
+                filteredAction = tabletButton ? MotionEvent.ACTION_MOVE : action;
+                break;
+            default:
+                return null;
+        }
+
+        MotionEvent.PointerProperties[] properties =
+                new MotionEvent.PointerProperties[count];
+        MotionEvent.PointerCoords[] coordinates = new MotionEvent.PointerCoords[count];
+        for (int i = 0; i < count; i++) {
+            properties[i] = new MotionEvent.PointerProperties();
+            source.getPointerProperties(keep[i], properties[i]);
+            coordinates[i] = new MotionEvent.PointerCoords();
+        }
+
+        int historyCount = source.getHistorySize();
+        boolean hasHistory = historyCount > 0;
+        long firstTime = hasHistory ? source.getHistoricalEventTime(0) : source.getEventTime();
+        for (int i = 0; i < count; i++) {
+            if (hasHistory)
+                source.getHistoricalPointerCoords(keep[i], 0, coordinates[i]);
+            else
+                source.getPointerCoords(keep[i], coordinates[i]);
+        }
+        MotionEvent result = MotionEvent.obtain(source.getDownTime(), firstTime,
+                hasHistory ? MotionEvent.ACTION_MOVE : filteredAction, count,
+                properties, coordinates, source.getMetaState(),
+                keepTablet ? source.getButtonState() : source.getButtonState()
+                        & ~(MotionEvent.BUTTON_STYLUS_PRIMARY
+                                | MotionEvent.BUTTON_STYLUS_SECONDARY),
+                source.getXPrecision(), source.getYPrecision(), source.getDeviceId(),
+                source.getEdgeFlags(), source.getSource(), source.getFlags());
+        if (hasHistory) {
+            for (int history = 1; history < historyCount; history++) {
+                for (int i = 0; i < count; i++)
+                    source.getHistoricalPointerCoords(keep[i], history, coordinates[i]);
+                result.addBatch(source.getHistoricalEventTime(history), coordinates,
+                        source.getMetaState());
+            }
+            for (int i = 0; i < count; i++)
+                source.getPointerCoords(keep[i], coordinates[i]);
+            result.addBatch(source.getEventTime(), coordinates, source.getMetaState());
+            result.setAction(filteredAction);
+        }
+        return result;
+    }
+
+    private void sendTabletPointerSample(MotionEvent event, int pointer, int history,
+                                         int capabilities, int buttons, int action,
+                                         long timeMsec) {
+        int tool = event.getToolType(pointer) == MotionEvent.TOOL_TYPE_ERASER
+                ? TabletInput.TOOL_ERASER : TabletInput.TOOL_PEN;
+        boolean current = history < 0;
+        int actionIndex = event.getActionIndex();
+        float pressure = normalizedTabletAxis(event, MotionEvent.AXIS_PRESSURE,
+                pointer, history);
+        boolean hoveringAction = action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_MOVE
+                || action == MotionEvent.ACTION_HOVER_EXIT;
+        boolean tipDown = !hoveringAction && pressure > 0f;
+        if (current && pointer == actionIndex) {
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN)
+                tipDown = true;
+            else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+                tipDown = false;
+        }
+        boolean proximity = !(current && pointer == actionIndex
+                && action == MotionEvent.ACTION_HOVER_EXIT);
+        int sampleButtons = proximity ? buttons : 0;
+
+        float x = current ? event.getX(pointer) : event.getHistoricalX(pointer, history);
+        float y = current ? event.getY(pointer) : event.getHistoricalY(pointer, history);
+        float[] nativeCoords = convertToNativeCoords(x, y);
+
+        float tiltX = 0f;
+        float tiltY = 0f;
+        if ((capabilities & TabletInput.CAP_TILT) != 0) {
+            float tilt = tabletAxis(event, MotionEvent.AXIS_TILT, pointer, history);
+            float orientation = tabletAxis(event, MotionEvent.AXIS_ORIENTATION, pointer, history);
+            float[] projected = TabletInput.projectTilt(tilt, orientation);
+            tiltX = projected[0];
+            tiltY = projected[1];
+        }
+        float distance = (capabilities & TabletInput.CAP_DISTANCE) != 0
+                ? normalizedTabletAxis(event, MotionEvent.AXIS_DISTANCE, pointer, history) : 0f;
+
+        int tipState = TabletInput.TIP_STATE_UNKNOWN;
+        if (hoveringAction)
+            tipState = TabletInput.TIP_STATE_UP;
+        else if (current && pointer == actionIndex
+                && (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN))
+            tipState = TabletInput.TIP_STATE_DOWN;
+        else if (current && pointer == actionIndex
+                && (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP))
+            tipState = TabletInput.TIP_STATE_UP;
+
+        tabletInput.update(new TabletInput.Sample(event.getDeviceId(), event.getPointerId(pointer),
+                tool, capabilities, nativeCoords[0], nativeCoords[1], pressure,
+                tiltX, tiltY, distance, proximity, tipDown, tipState,
+                false, sampleButtons, timeMsec));
+    }
+
+    private static int tabletButtons(MotionEvent event) {
+        int state = event.getButtonState();
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_BUTTON_PRESS)
+            state |= event.getActionButton();
+        else if (action == MotionEvent.ACTION_BUTTON_RELEASE)
+            state &= ~event.getActionButton();
+        int buttons = 0;
+        if ((state & MotionEvent.BUTTON_STYLUS_PRIMARY) != 0)
+            buttons |= TabletInput.BUTTON_PRIMARY;
+        if ((state & MotionEvent.BUTTON_STYLUS_SECONDARY) != 0)
+            buttons |= TabletInput.BUTTON_SECONDARY;
+        return buttons;
+    }
+
+    private static int tabletCapabilities(MotionEvent event) {
+        int capabilities = 0;
+        if (tabletMotionRange(event, MotionEvent.AXIS_PRESSURE) != null)
+            capabilities |= TabletInput.CAP_PRESSURE;
+        if (tabletMotionRange(event, MotionEvent.AXIS_TILT) != null
+                && tabletMotionRange(event, MotionEvent.AXIS_ORIENTATION) != null)
+            capabilities |= TabletInput.CAP_TILT;
+        if (tabletMotionRange(event, MotionEvent.AXIS_DISTANCE) != null)
+            capabilities |= TabletInput.CAP_DISTANCE;
+        return capabilities;
+    }
+
+    private static InputDevice.MotionRange tabletMotionRange(MotionEvent event, int axis) {
+        InputDevice device = event.getDevice();
+        if (device == null)
+            return null;
+        InputDevice.MotionRange range = device.getMotionRange(axis, event.getSource());
+        return range != null ? range : device.getMotionRange(axis);
+    }
+
+    private static float tabletAxis(MotionEvent event, int axis, int pointer, int history) {
+        return history < 0 ? event.getAxisValue(axis, pointer)
+                : event.getHistoricalAxisValue(axis, pointer, history);
+    }
+
+    private static float normalizedTabletAxis(MotionEvent event, int axis, int pointer,
+                                              int history) {
+        float value = tabletAxis(event, axis, pointer, history);
+        InputDevice.MotionRange range = tabletMotionRange(event, axis);
+        if (range != null && range.getMax() > range.getMin())
+            value = (value - range.getMin()) / (range.getMax() - range.getMin());
+        return Float.isFinite(value) ? Math.max(0f, Math.min(1f, value)) : 0f;
+    }
+
     private void releaseAllMouseButtons() {
         if (savedBS == 0)
             return;
@@ -2431,13 +3523,33 @@ public class MainActivity extends Activity
         savedBS = 0;
     }
 
+    /**
+     * Releases keys this window forwarded, for callers that end interception
+     * without a lifecycle transition to hang it off.
+     *
+     * <p>The accessibility service can stop -- the switch turned off, the
+     * activity going away, the system reclaiming it -- between a key's press and
+     * its release. Nothing else lifts a key in that window, so the desktop holds
+     * it down until the user presses that same key again.
+     */
+    public void releaseForwardedKeys() {
+        releaseAllForwardedKeys();
+    }
+
     private boolean isMouseEvent(MotionEvent event) {
         int source = event.getSource();
+        if (event.getPointerCount() == 0)
+            return false;
+        int toolType = event.getToolType(Math.min(event.getActionIndex(),
+                event.getPointerCount() - 1));
+        // Pens are sent through the tablet protocol before this mouse/touch split.
+        if (toolType == MotionEvent.TOOL_TYPE_STYLUS
+                || toolType == MotionEvent.TOOL_TYPE_ERASER)
+            return false;
         if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
             return false;
         if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
             return false;
-        int toolType = event.getToolType(event.getActionIndex());
         return toolType == MotionEvent.TOOL_TYPE_MOUSE
             || toolType == MotionEvent.TOOL_TYPE_FINGER;
     }
@@ -2496,7 +3608,6 @@ public class MainActivity extends Activity
         return true;
     }
 
-    // 原有 handleTouchEvent 一字未改
     private boolean handleTouchEvent(MotionEvent event) {
         int action = event.getActionMasked();
         int pointerIdx = event.getActionIndex();
@@ -2504,33 +3615,41 @@ public class MainActivity extends Activity
     
         switch (action) {
             case MotionEvent.ACTION_DOWN:
+                forwardedTouches.releaseAll();
+                if (isTabletTool(event.getToolType(pointerIdx)))
+                    return true;
+                // fall through
             case MotionEvent.ACTION_POINTER_DOWN:
+                if (isTabletTool(event.getToolType(pointerIdx)))
+                    return true;
                 float[] downCoords = convertToNativeCoords(event.getX(pointerIdx), event.getY(pointerIdx));
-                mNative.sendTouch(0, downCoords[0], downCoords[1], pointerId);
-                mNative.sendTouchFrame();
+                forwardedTouches.send(0, pointerId, downCoords[0], downCoords[1]);
+                forwardedTouches.frame();
                 return true;
             
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP:
+                if (isTabletTool(event.getToolType(pointerIdx)))
+                    return true;
                 float[] upCoords = convertToNativeCoords(event.getX(pointerIdx), event.getY(pointerIdx));
-                mNative.sendTouch(1, upCoords[0], upCoords[1], pointerId);
-                mNative.sendTouchFrame();
+                forwardedTouches.send(1, pointerId, upCoords[0], upCoords[1]);
+                if (action == MotionEvent.ACTION_UP)
+                    forwardedTouches.releaseAll();
+                forwardedTouches.frame();
                 return true;
             
             case MotionEvent.ACTION_MOVE:
                 for (int i = 0; i < event.getPointerCount(); i++) {
+                    if (isTabletTool(event.getToolType(i)))
+                        continue;
                     float[] moveCoords = convertToNativeCoords(event.getX(i), event.getY(i));
-                    mNative.sendTouch(2, moveCoords[0], moveCoords[1], event.getPointerId(i));
+                    forwardedTouches.send(2, event.getPointerId(i), moveCoords[0], moveCoords[1]);
                 }
-                mNative.sendTouchFrame();
+                forwardedTouches.frame();
                 return true;
             
             case MotionEvent.ACTION_CANCEL:
-                for (int i = 0; i < event.getPointerCount(); i++) {
-                    float[] cancelCoords = convertToNativeCoords(event.getX(i), event.getY(i));
-                    mNative.sendTouch(1, cancelCoords[0], cancelCoords[1], event.getPointerId(i));
-                }
-                mNative.sendTouchFrame();
+                forwardedTouches.releaseAll();
                 return true;
         }
         return false;
@@ -2548,16 +3667,4 @@ public class MainActivity extends Activity
         }
     }
     
-    private float[] convertMouseToNative(float x, float y) {
-        if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                           (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                           (float)customScreenHeight / viewHeight : 1.0f;
-            return new float[]{x * scaleX, y * scaleY};
-        } else {
-            return new float[]{x / surfaceScale, y / surfaceScale};
-        }
-    }
-
 }

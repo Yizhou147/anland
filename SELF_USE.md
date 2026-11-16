@@ -7,13 +7,13 @@
 
 | 功能 | main 分支 | self-use 分支 |
 |---|---|---|
-| Back 键默认行为 | 默认打开扩展按键栏（`bound_keycode` 默认 `-1`） | 默认绑定为「系统软键盘切换键」（`bound_keycode` 默认 `KEYCODE_BACK`），可在设置中改回 |
-| 扩展按键栏默认键 | 默认布局 | 额外加入 `C` `V` `SHIFT` `BS` `Enter` 快捷键行 |
+| Back 键默认行为 | 默认不绑定（`bound_keycode` 默认 `-1`） | 默认绑定为「系统软键盘切换键」（`bound_keycode` 默认 `KEYCODE_BACK`），可在设置中改回 `-1` |
+| 扩展按键栏 | 上游已重构：按键栏并入分体弧形虚拟键盘（自带 C/V/Shift/BS/Enter，wing 键可编辑） | 与上游一致；自用旧版额外按键行随上游重构移除 |
 | 双指开合 / 三指及以上手势 | 作为触摸转发到桌面（缩放等） | **默认禁用**，手势被吞掉；可在 设置 → 触摸板 → 「禁用双指开合与多指手势」中开启转发（默认开启禁用） |
 | 软键盘弹出时抬起桌面 | 默认开启（`keyboard_floating` 默认 `false`） | 默认关闭（`keyboard_floating` 默认 `true`），软键盘浮动不压缩桌面区域 |
 | 触摸板模式默认 | 默认关闭（`touchpad_mode` 默认 `false`） | 默认开启（默认 `true`），屏幕触摸板直接可用 |
 | 鼠标加速度默认值 | `1.0` | `1.5`（设置项「鼠标灵敏度」） |
-| 小窗（freeform）模式键盘 | main 早期无修复 | 已合入 freeform 键盘修复：键盘位置随窗口缩放重定位、IME 可见性自管理标志，扩展按键栏随软键盘同显同隐 |
+| 小窗（freeform）模式键盘 | main 早期无修复 | 已合入 freeform 键盘修复：键盘位置随窗口缩放重定位、IME 可见性自管理标志（窗口失焦时复位输入法状态） |
 | 应用签名 | 每次云编译随机生成 debug keystore | 本地与云编译共用同一固定 keystore（GitHub Secret `ANLAND_KEYSTORE_BASE64`），APK 可直接覆盖安装无需卸载 |
 
 ## 构建产物
